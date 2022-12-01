@@ -6,7 +6,7 @@ Example *config.ini*:
 ```
 [global_settings]
 debug=true
-user_whitelist=USC1GDC2V
+user_whitelist=USC13332V
 SLACK_BOT_TOKEN=xoxb-....
 SLACK_APP_TOKEN=xapp-....
 
