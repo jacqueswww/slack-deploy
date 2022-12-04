@@ -18,3 +18,11 @@ playbook_params=-i project.hosts project.yml -b --tags deploy
 working_dir=/home/jacques/projects/project2
 playbook_params=-i project2.hosts project2.yml --tags deploy
 ```
+
+Required App config:
+
+```
+Bot token: https://api.slack.com/authentication/basics
+Socket Client Mode: https://slack.dev/python-slack-sdk/socket-mode/index.html
+
+```
