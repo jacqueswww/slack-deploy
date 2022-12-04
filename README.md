@@ -22,9 +22,16 @@ playbook_params=-i project2.hosts project2.yml --tags deploy
 ### Required App config:
 
 
-Bot token: https://api.slack.com/authentication/basics
+Bot token
+  - https://api.slack.com/authentication/basics
+
 OAuth Scopes required:
   - `chat:write`
   - `app_mentions:read`
+  - `groups:write`
 
-Socket Client Mode: https://slack.dev/python-slack-sdk/socket-mode/index.html
+Events Subscriptions:
+  -   `app_mention`
+
+Socket Client Mode
+  - https://slack.dev/python-slack-sdk/socket-mode/index.html
