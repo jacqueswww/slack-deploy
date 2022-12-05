@@ -21,6 +21,45 @@ ENVIRONMENTS = {}
 GLOBAL_SETTINGS = {}
 
 
+def run_git_pull(web_client, payload, env):
+    RUNNING_JOBS[env] = True
+    envs, _ = get_config()
+    env_info = envs[env]
+
+    with tempfile.NamedTemporaryFile(suffix='.log') as logfile:
+        git_cmd = shutil.which("git")
+        completed_ps = subprocess.run(
+            [git_cmd, 'pull', 'origin', env_info.get('branch', 'master')],
+            stdout=logfile,
+            stderr=logfile,
+            cwd=env_info['working_dir']
+        )
+        logfile.seek(0)
+        output_txt = logfile.read().decode()
+        result_msg = f"[{env_info['working_dir']}] "
+        result_msg += 'git pull done' if completed_ps.returncode == 0 else 'git pull failed'
+        web_client.chat_postMessage(
+            channel=payload["event"]["channel"],
+            thread_ts=payload["event"]["ts"],
+            text=result_msg
+        )
+        if output_txt:
+            print(output_txt)
+            web_client.chat_postMessage(
+                channel=payload["event"]["channel"],
+                thread_ts=payload["event"]["ts"],
+                text='Log Output',
+                blocks=[{
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"```{output_txt[-2000:]}```"
+                    }
+                }]
+            )
+    RUNNING_JOBS[env] = False
+
+
 def run_cmd(web_client, payload, env):
     RUNNING_JOBS[env] = True
     envs, _ = get_config()
@@ -70,9 +109,13 @@ def send_response(client, req, msg):
     return response
 
 
+def auth_blocked(client, req, global_settings):
+    return req.payload["event"]['user'] not in global_settings['user_whitelist'].split(',')
+
+
 def start_deploy(client, req):
     envs, global_settings = get_config()
-    if req.payload["event"]['user'] not in global_settings['user_whitelist'].split(','):
+    if auth_blocked(client, req, global_settings):
         send_response(client, req, "You are not authorised to deploy")
         return
     env_name = req.payload["event"]["text"].split('deploy')
@@ -96,6 +139,24 @@ def start_deploy(client, req):
     thread.start()
 
 
+def refresh_repos(client, req):
+    envs, global_settings = get_config()
+    if auth_blocked(client, req, global_settings):
+        send_response(client, req, "You are not authorised to refresh_repos")
+        return
+
+    working_dirs = set()
+    for env_name, env_info in envs.items():
+        working_dir = env_info['working_dir']
+        if working_dir not in working_dirs:
+            working_dirs.add(working_dir)
+            thread = Thread(
+                target=run_git_pull,
+                args=(client.web_client, req.payload, env_name)
+            )
+            thread.start()
+
+
 def process(client, req):
     envs, global_settings = get_config()
 
@@ -115,6 +176,11 @@ def process(client, req):
             and "deploy" in req.payload["event"]["text"]:
 
         start_deploy(client, req)
+
+    if req.payload["event"]["type"] == "app_mention" \
+            and "refresh-repos" in req.payload["event"]["text"]:
+
+        refresh_repos(client, req)
 
     # Acknowledge the request
     response = SocketModeResponse(envelope_id=req.envelope_id)
