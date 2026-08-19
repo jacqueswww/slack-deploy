@@ -170,7 +170,7 @@ def process(client, req):
 
     if req.payload["event"]["type"] == "app_mention" \
             and "list" in req.payload["event"]["text"]:
-        send_response(client, req, "Configured environments: " + ','.join(envs))
+        send_response(client, req, "Configured environments: " + '\n'.join(envs))
 
     if req.payload["event"]["type"] == "app_mention" \
             and "deploy" in req.payload["event"]["text"]:
