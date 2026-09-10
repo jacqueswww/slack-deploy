@@ -1,0 +1,8 @@
+{% extends "layout.html" %}{% block body %}
+<h2>Job {{ job.id }} &mdash; {{ job.kind }} &mdash; {{ job.status }}</h2>
+<p>exit {{ job.exit_code if job.exit_code is not none else '-' }},
+triggered by {{ job.triggered_by or '-' }},
+{{ job.started_at }} to {{ job.finished_at or 'running' }}</p>
+<pre>{{ job.log or '' }}</pre>
+<p><a href="/">back</a></p>
+{% endblock %}

@@ -1,0 +1,87 @@
+{% macro scope_picker(projects, environments) %}
+<label>Scope <select name="scope" onchange="
+  var g=this.value==='global';
+  this.form.scope_id.disabled=g; if(g) this.form.scope_id.value=0;">
+<option value="global">global</option>
+<option value="project">project</option>
+<option value="environment">environment</option>
+</select></label>
+<label>Target <select name="scope_id">
+<option value="0">(global)</option>
+{% for p in projects %}<option value="{{ p.id }}">project: {{ p.name }}</option>{% endfor %}
+{% for e in environments %}<option value="{{ e.id }}">env: {{ e.project_name }}/{{ e.name }}</option>{% endfor %}
+</select></label>
+{% endmacro %}
+<!doctype html>
+<html><head><meta charset="utf-8"><title>slack-deploy</title>
+<link rel="icon" type="image/png" href="/static/favicon.png">
+<script src="/static/jquery.min.js"></script>
+<style>
+body{font:14px/1.5 system-ui,sans-serif;margin:0;background:#f5f6f8;color:#111}
+header{background:#1d2027;color:#fff;padding:.4rem 1rem;display:flex;gap:1rem;align-items:center}
+header img{height:34px;width:auto;display:block}
+header .brand{display:flex;gap:.5rem;align-items:center;font-weight:600;letter-spacing:.02em}
+header a{color:#8cc4ff;text-decoration:none}
+header a:hover{text-decoration:underline}
+main{padding:1rem;max-width:1100px}
+h2{font-size:1.05rem;margin:1.2rem 0 .4rem}
+table{border-collapse:collapse;width:100%;background:#fff;margin-bottom:.5rem}
+th,td{border:1px solid #e0e2e6;padding:.3rem .5rem;text-align:left}
+th{background:#eef0f3;font-weight:600}
+pre{background:#14171c;color:#e6e6e6;padding:.75rem;overflow:auto;max-height:34rem}
+input,select,button{padding:.3rem;font:inherit}
+button{cursor:pointer}
+fieldset{background:#fff;border:1px solid #e0e2e6;margin-bottom:1rem}
+legend{font-weight:600}
+.err{background:#fdecec;border:1px solid #d38b8b;padding:.5rem;margin-bottom:.8rem}
+.mask{color:#999;letter-spacing:1px}
+.card{background:#fff;border:1px solid #e0e2e6;padding:1.2rem;max-width:30rem;margin:3rem auto}
+.card-logo{display:block;width:120px;height:auto;margin:0 auto .4rem}
+.card h2{text-align:center;margin-top:0}
+.pick{user-select:all;word-break:break-all;background:#eef0f3;padding:.2rem}
+.qr{background:#fff;padding:.6rem;width:min(220px,60vw);margin:0 auto 1rem}
+.qr svg{display:block;width:100%;height:auto}
+details summary{cursor:pointer;color:#456}
+.row{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap}
+#lock{position:fixed;inset:0;background:rgba(20,23,28,.97);color:#fff;display:none;
+  align-items:center;justify-content:center;z-index:99}
+#lock div{text-align:center}
+</style></head><body>
+{% if username %}<header>
+<span class="brand"><img src="/static/logo.png" alt=""> slack-deploy</span>
+<a href="/">dashboard</a><a href="/secrets">variables</a><a href="/credentials">credentials</a>
+<a href="/schedules">schedules</a><a href="/users">users</a>
+<span style="margin-left:auto">{{ username }}{% if is_admin %} · admin{% endif %}</span>
+<a href="/logout">log out</a>
+</header>{% endif %}
+<main>{% block body %}{% endblock %}</main>
+
+{% if unlocked %}
+<div id="lock"><div>
+<h2>Locked after {{ soft_seconds // 60 }} minutes idle</h2>
+<p>Enter a 2FA code to carry on.</p>
+<input id="lockcode" inputmode="numeric" maxlength="6" placeholder="000000"
+  autocomplete="one-time-code">
+<button id="lockgo">Unlock</button>
+<p id="lockerr" style="color:#ff9b9b"></p>
+</div></div>
+<script>
+$(function () {
+  var idle = null, soft = {{ soft_seconds }} * 1000;
+  function arm() { clearTimeout(idle); idle = setTimeout(lock, soft); }
+  function lock() { $('#lock').css('display', 'flex'); $('#lockcode').focus(); }
+  $(document).on('mousemove keydown click scroll', arm);
+  $('#lockgo').on('click', function () {
+    $.post('/relock', {code: $('#lockcode').val(), ajax: 1, csrf: '{{ csrf }}'})
+      .done(function (r) {
+        if (r.ok) { $('#lock').hide(); $('#lockcode').val(''); $('#lockerr').text(''); arm(); }
+        else { $('#lockerr').text('Incorrect code'); }
+      })
+      .fail(function () { location.href = '/relock'; });
+  });
+  $('#lockcode').on('keydown', function (e) { if (e.key === 'Enter') $('#lockgo').click(); });
+  arm();
+});
+</script>
+{% endif %}
+</body></html>

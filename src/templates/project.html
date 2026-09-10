@@ -1,0 +1,20 @@
+{% extends "layout.html" %}{% block body %}
+<h2>{{ 'Edit' if project else 'New' }} project</h2>
+<form method="post" action="/project"><fieldset>
+<input type="hidden" name="csrf" value="{{ csrf }}">
+{% if project %}<input type="hidden" name="id" value="{{ project.id }}">{% endif %}
+<p><label>Name <input name="name" value="{{ project.name if project else '' }}" required></label></p>
+<p><label>Checkout directory <input name="working_dir" size="50"
+   value="{{ project.working_dir if project else '' }}" required></label></p>
+<p><label>Branch <input name="branch" value="{{ project.branch if project else 'master' }}"></label></p>
+<p><label>Clone URL <input name="git_remote" size="50"
+   value="{{ project.git_remote or '' if project else '' }}"
+   placeholder="https://github.com/org/repo.git (optional)"></label><br>
+<span class="mask">HTTPS uses the read-only github_pat credential; SSH uses the
+daemon user's own key. Leave blank if you check the repo out by hand.</span></p>
+<button>Save</button>
+{% if project %}<button name="delete" value="1"
+  onclick="return confirm('Delete this project, its environments and their secrets?')"
+  >Delete</button>{% endif %}
+</fieldset></form><p><a href="/">back</a></p>
+{% endblock %}
