@@ -16,6 +16,10 @@ token held in an encrypted store that only a human-typed passphrase can open.
   stored alongside and resolved narrowest scope first.
 - **Structured environments.** Inventory, playbook, tags, limit and become are
   separate fields. No free-text argument string ever reaches `ansible-playbook`.
+- **Hosts per project.** Name, address, groups and an optional pinned SSH host
+  key. Written out as the inventory for each run, alone or beside the
+  environment's inventory file, and as a known_hosts file, so a changed host key
+  fails the deploy instead of being accepted.
 - **Git sync.** Clone or fast-forward each project's repo on demand or on a
   schedule, over HTTPS with a stored PAT or over SSH.
 - **Backups.** Daily sealed zip of the whole data directory, 90-day retention,
@@ -46,7 +50,8 @@ Full analysis, residual risks and deployment requirements: [THREAT-MODEL.md](THR
 
 ## Requirements
 
-- Linux, Python 3.12, git 2.x, a Slack app with Socket Mode.
+- Linux, Python 3.12, git 2.x, a Slack app with Socket Mode. Ansible is installed
+  into the venv.
 - Target hosts reachable over SSH from the deploy box.
 
 ## Setup
@@ -57,19 +62,61 @@ make init                      # data/, both databases, the first admin
 python manage.py project-add myproj --dir /srv/ansible/myproj \
     --remote https://github.com/org/myproj.git --branch main
 python manage.py cred-gen deploy-key --project myproj    # prints the public key
+python manage.py host-add myproj web1 --address 10.0.0.5 --groups web \
+    --key "$(ssh-keyscan -t ed25519 10.0.0.5 2>/dev/null | cut -d' ' -f2-)"
 python manage.py secret-set db_password --project myproj --env prod
-make sync                      # clone the repo
+python manage.py sync          # clone the repo
 make bot                       # prompts for the passphrase, stays up
 make web                       # 127.0.0.1:8080, reach over an SSH forward
 make doctor                    # permissions, ownership, host posture
 ```
 
-Environments are created in the web UI (admin) or by `import-config` from an
-old `config.ini`. Every user registers 2FA on first web login.
+Environments are created in the web UI (admin). Every user registers 2FA on
+first web login by typing the shown secret into their authenticator.
 
-Production: install `deploy/slack-deploy-bot.service` and
-`deploy/slack-deploy-web.service`, apply `deploy/sysctl-slack-deploy.conf`, run
-`make doctor` until it reports no problems.
+## Production
+
+`doctor` only reports, it changes nothing. It passes when the daemon's uid owns
+`data/` and `backups/` (0700) and nothing else: the checkout and `venv/` belong
+to root, so a playbook that goes bad cannot rewrite the program that is next
+handed the passphrase. The unit adds `ProtectSystem=strict`, which mounts
+everything except the data paths read-only for the running daemon. As root:
+
+```
+# 1. service account; data, backups and checkouts are the only paths it owns
+useradd --system --home-dir /var/lib/slack-deploy --create-home \
+    --shell /usr/sbin/nologin slack-deploy
+install -d -o slack-deploy -g slack-deploy -m 700 \
+    /var/lib/slack-deploy/data /var/lib/slack-deploy/backups /srv/ansible
+
+# 2. code and venv: root-owned, world-readable, writable by nobody else
+git clone https://github.com/jacqueswww/slack-deploy /opt/slack-deploy
+cd /opt/slack-deploy && make setup && chmod -R go-w /opt/slack-deploy
+
+# 3. every manage.py command runs as the daemon uid against its data dir
+SD="sudo -u slack-deploy -H env SLACK_DEPLOY_DATA=/var/lib/slack-deploy/data \
+    /opt/slack-deploy/venv/bin/python /opt/slack-deploy/manage.py"
+$SD init
+
+# 4. kernel settings and units (doctor checks for both)
+install -m 644 deploy/sysctl-slack-deploy.conf /etc/sysctl.d/60-slack-deploy.conf
+sysctl --system
+cp deploy/slack-deploy@.service /etc/systemd/system/
+cp -r deploy/slack-deploy@bot.service.d /etc/systemd/system/
+systemctl daemon-reload
+
+# 5. must print "no problems found" before anything is enabled
+$SD doctor
+
+# 6. start. The bot waits for the passphrase on tty12, after every (re)start;
+#    change TTYPath in the drop-in for a serial console
+systemctl enable --now slack-deploy@web slack-deploy@bot
+```
+
+Use `$SD` for all later admin commands (`project-add`, `secret-set`, `sync`,
+`backup`, ...). Reach the web UI over `ssh -L 8080:127.0.0.1:8080 deploybox`.
+Findings doctor still lists after this are host posture (swap on disk, IOMMU
+off, unmitigated CPU bugs) and need a kernel or BIOS change, not a chmod.
 
 ## Slack app
 
@@ -92,9 +139,9 @@ python manage.py user-add alice --slack-id U0123456 --admin
 | `secret-set`, `secret-list`, `vars-import`, `vars-export` | Variables per scope (`--project`, `--env`) |
 | `cred-set`, `cred-gen`, `cred-list`, `cred-rm` | SSH keys and GitHub PATs |
 | `project-add`, `project-list`, `sync` | Repos and checkouts |
+| `host-add <project> <name> [--address --groups --key]`, `host-list`, `host-rm` | A project's target hosts |
 | `backup`, `restore <zip>`, `rekey` | Sealed backups, passphrase change |
 | `schedule-add`, `schedule-list` | Daily backup or git pull at HH:MM |
-| `import-config [path]` | Migrate a pre-store `config.ini` |
 
 ## Tests
 
