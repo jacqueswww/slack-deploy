@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Encryption at rest, key derivation, rekey, and refusing to clobber a store."""
+import json
 import sys
 
 import harness
@@ -17,6 +18,46 @@ def encryption_at_rest():
     raw = db.SECRETS_DB.read_bytes()
     assert b'hunter2' not in raw, 'the value must not be readable on disk'
     assert b'pg_password' not in raw, 'not even the name should be readable'
+
+
+def the_crypto_library_gives_known_answers():
+    """A swapped or backdoored libcrypto that still 'works' must not be trusted."""
+    db.crypto_self_test()
+    real = db._SCRYPT_KAT
+    db._SCRYPT_KAT = real[:3] + ('00' * 64,)
+    try:
+        db.crypto_self_test()
+        raise AssertionError('a wrong scrypt answer must refuse to start')
+    except SystemExit:
+        pass
+    finally:
+        db._SCRYPT_KAT = real
+    real = db._GCM_KAT
+    db._GCM_KAT = real[:3] + ('00' * 32,)
+    try:
+        db.crypto_self_test()
+        raise AssertionError('a wrong AES-GCM answer must refuse to start')
+    except SystemExit:
+        pass
+    finally:
+        db._GCM_KAT = real
+
+
+def the_key_is_locked_in_ram_and_the_passphrase_is_wipeable():
+    """A bytearray passphrase derives the same key as the str, so the CLI can wipe
+    it; the key page is mlocked so it never reaches swap."""
+    weak = dict(db.KEY_SCRYPT, n=2 ** 10, maxmem=64 * 1024 * 1024)
+    salt = bytes(16)
+    typed = bytearray(GOOD.encode())
+    assert db.derive_key(typed, salt, weak) == db.derive_key(GOOD, salt, weak)
+    db.wipe(typed)
+    assert not any(typed)
+    assert STORE.locked_in_ram, 'mlock of the key page failed'
+    lck = open('/proc/self/status').read().split('VmLck:')[1].split('\n')[0].strip()
+    assert lck != '0 kB', lck
+    twin = db.SecretStore.unlock(bytearray(GOOD.encode()))
+    assert twin.get('environment', 99, 'pg_password') == 'hunter2-in-the-clear'
+    twin.close()
 
 
 def wrong_password_is_refused():
@@ -89,6 +130,20 @@ def rekey_swaps_the_password():
     rekeyed.close()
 
 
+def a_clone_has_its_own_key_and_wipes_it():
+    """Worker threads get a clone, so closing it cannot pull the key from under a session."""
+    store = db.SecretStore.unlock('a different long passphrase')
+    twin = store.clone()
+    assert twin._key == store._key and twin._key is not store._key
+    assert twin.get(db.GLOBAL_SCOPE, 0, 'slack_bot_token') == 'xoxb-must-survive'
+    twin.close()
+    assert not any(twin._key), 'close must zero the key'
+    assert store.get(db.GLOBAL_SCOPE, 0, 'slack_bot_token') == 'xoxb-must-survive', \
+        'the original keeps working'
+    store.close()
+    assert not any(store._key)
+
+
 def short_passwords_are_refused():
     for bad in ('short', 'x' * (db.MIN_PASSPHRASE - 1)):
         try:
@@ -98,8 +153,65 @@ def short_passwords_are_refused():
             pass
 
 
+def a_rekey_that_dies_before_the_swap_still_opens():
+    """kdf.json must carry both salts until secrets.db has been replaced."""
+    current, wanted = 'a different long passphrase', 'a third long passphrase!!'
+    real = db.os.replace
+
+    def power_cut(*a):
+        raise OSError('power cut')
+    db.os.replace = power_cut
+    try:
+        db.rekey(current, wanted)
+        raise AssertionError('the simulated crash must propagate')
+    except OSError:
+        pass
+    finally:
+        db.os.replace = real
+    assert 'previous' in json.loads(db.KDF_FILE.read_text()), 'both salts must be on disk'
+    store = db.SecretStore.unlock(current)     # opens via the previous salt
+    assert store.get(db.GLOBAL_SCOPE, 0, 'slack_bot_token') == 'xoxb-must-survive'
+    store.close()
+    db.rekey(current, wanted)                  # the rerun finishes the job
+    assert 'previous' not in json.loads(db.KDF_FILE.read_text())
+    db.SecretStore.unlock(wanted).close()
+
+
+def a_rekey_that_dies_after_the_swap_still_opens():
+    """Crash between replacing secrets.db and the final kdf.json write."""
+    current, wanted = 'a third long passphrase!!', 'the fourth long passphrase'
+    real = db.write_kdf
+
+    def dies_on_final_write(salt, params=None, previous=None):
+        if previous is None:
+            raise OSError('power cut')
+        real(salt, params, previous)
+    db.write_kdf = dies_on_final_write
+    try:
+        db.rekey(current, wanted)
+        raise AssertionError('the simulated crash must propagate')
+    except OSError:
+        pass
+    finally:
+        db.write_kdf = real
+    assert 'previous' in json.loads(db.KDF_FILE.read_text())
+    db.SecretStore.unlock(wanted).close()      # the new file, the new salt
+    try:
+        db.SecretStore.unlock(current)
+        raise AssertionError('the old passphrase must not open the new file')
+    except db.Locked:
+        pass
+    db.rekey(wanted, 'a fifth and final passphrase')
+    assert 'previous' not in json.loads(db.KDF_FILE.read_text())
+    db.SecretStore.unlock('a fifth and final passphrase').close()
+
+
 if __name__ == '__main__':
     sys.exit(harness.run(
-        encryption_at_rest, wrong_password_is_refused, cipher_settings_are_maxed,
+        encryption_at_rest, the_crypto_library_gives_known_answers,
+        the_key_is_locked_in_ram_and_the_passphrase_is_wipeable,
+        wrong_password_is_refused, cipher_settings_are_maxed,
         stored_kdf_params_win, init_never_overwrites, rekey_swaps_the_password,
-        short_passwords_are_refused))
+        a_clone_has_its_own_key_and_wipes_it, short_passwords_are_refused,
+        a_rekey_that_dies_before_the_swap_still_opens,
+        a_rekey_that_dies_after_the_swap_still_opens))

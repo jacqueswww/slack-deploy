@@ -1,0 +1,67 @@
+# Slack daemon. Install to /etc/systemd/system/, then:
+#   systemctl daemon-reload && systemctl start slack-deploy-bot && systemd-analyze security slack-deploy-bot
+# It prompts for the global password on the console at start: systemd-ask-password
+# forwards the prompt; answer with `systemd-tty-ask-password-agent --query`.
+#
+# Layout this unit assumes (change the paths, keep the ownership):
+#   /opt/slack-deploy            the checkout and venv, owned by root, mode 755
+#   /var/lib/slack-deploy/data   owned by slack-deploy, mode 700
+#   /var/lib/slack-deploy/backups                        700
+#   /srv/ansible                 project checkouts, owned by slack-deploy
+[Unit]
+Description=slack-deploy Slack daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=slack-deploy
+Group=slack-deploy
+WorkingDirectory=/opt/slack-deploy
+Environment=SLACK_DEPLOY_DATA=/var/lib/slack-deploy/data
+Environment=HOME=/var/lib/slack-deploy
+Environment=ANSIBLE_LOCAL_TEMP=/tmp/ansible
+Environment=ANSIBLE_SSH_CONTROL_PATH_DIR=/tmp/ansible/cp
+ExecStart=/opt/slack-deploy/venv/bin/python /opt/slack-deploy/manage.py bot
+StandardInput=tty-force
+TTYPath=/dev/tty12
+Restart=on-failure
+RestartSec=10
+
+# --- what a compromised playbook, running as this uid, may no longer do ---
+# Only these paths are writable. The code and the venv are not: a hostile deploy
+# cannot trojan the program that is next handed the passphrase.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/slack-deploy /srv/ansible
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# keep the key and the plaintext vars out of any core file or swap
+LimitCORE=0
+LimitMEMLOCK=64M
+MemoryDenyWriteExecute=no
+# (ansible-runner and ssh need executable memory for the JIT-free but mmap-heavy
+# python/openssl stack; leave MDWE off, everything above still applies)
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

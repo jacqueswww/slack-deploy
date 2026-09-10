@@ -3,6 +3,8 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
+import re
 import struct
 import time
 from datetime import date, datetime
@@ -28,8 +30,12 @@ MIN_PASSPHRASE = 20
 # start and once per web login, never per request. dklen must stay 32 (AES-256).
 KEY_SCRYPT = {'n': 2 ** 18, 'r': 8, 'p': 1, 'maxmem': 512 * 1024 * 1024, 'dklen': 32}
 # User passwords stay cheaper: changing these invalidates every stored hash, and
-# they guard an account, not the encrypted store.
-PW_SCRYPT = {'n': 2 ** 15, 'r': 8, 'p': 1, 'maxmem': 64 * 1024 * 1024, 'dklen': 32}
+# they guard an account, not the encrypted store. dklen is 64: the first 32 bytes
+# are the stored verifier, the last 32 wrap the user's TOTP seed and are never
+# stored. scrypt's final PBKDF2 step makes the first block independent of dklen,
+# so hashes made with dklen=32 still verify.
+PW_SCRYPT = {'n': 2 ** 15, 'r': 8, 'p': 1, 'maxmem': 64 * 1024 * 1024, 'dklen': 64}
+MIN_PASSWORD = 12
 KDF_KEYS = ('n', 'r', 'p', 'maxmem', 'dklen')
 
 # SQLCipher 4 defaults to memory_security OFF: no mlock, no wipe of key material.
@@ -41,6 +47,7 @@ CIPHER_PRAGMAS = (
     'PRAGMA cipher_default_kdf_algorithm = PBKDF2_HMAC_SHA512',
 )
 GLOBAL_SCOPE = 'global'
+SCOPES = ('global', 'project', 'environment')
 MIGRATIONS = ROOT / 'migrations'
 
 MIGRATION_TABLE = """
@@ -59,12 +66,21 @@ def pending(conn, kind):
 
 
 def migrate(conn, kind):
-    """Apply migrations/<kind>/*.sql in filename order, once each."""
+    """Apply migrations/<kind>/*.sql in filename order, once each.
+
+    Script and version row go in one transaction, so a failing statement leaves
+    nothing half-applied for the next run to trip over."""
     applied = []
     for path in pending(conn, kind):
-        conn.executescript(path.read_text())
-        conn.execute('INSERT INTO schema_migrations (version) VALUES (?)', (path.stem,))
-        conn.commit()
+        if not re.fullmatch(r'\w+', path.stem):
+            raise ValueError(f'bad migration name: {path.name}')
+        try:
+            conn.executescript(
+                f"BEGIN;\n{path.read_text()}\n"
+                f"INSERT INTO schema_migrations (version) VALUES ('{path.stem}');\nCOMMIT;")
+        except Exception:
+            conn.rollback()
+            raise
         applied.append(path.stem)
     return applied
 
@@ -74,7 +90,8 @@ class Locked(Exception):
 
 
 def harden_process():
-    """Block core dumps and same-uid ptrace/proc-mem reads of the derived key."""
+    """Block core dumps and same-uid ptrace/proc-mem reads of the derived key, and
+    refuse to run on a crypto library that gives wrong answers."""
     try:
         import resource
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -85,6 +102,30 @@ def harden_process():
         ctypes.CDLL('libc.so.6', use_errno=True).prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE
     except Exception:
         pass
+    crypto_self_test()
+
+
+# Known answers: RFC 7914 section 12 for scrypt, NIST GCM test case 2 for AES-GCM.
+# A library swapped for one that "works" but returns something else fails here
+# before a passphrase is ever typed into it.
+_SCRYPT_KAT = ('password', b'NaCl', dict(n=1024, r=8, p=16, dklen=64),
+               'fdbabe1c9d3472007856e7190d01e9fe7c6ad7cbc8237830e77376634b3731622eaf30d92e'
+               '22a3886ff109279d9830dac727afb94a83ee6d8360cbdfa2cc0640')
+_GCM_KAT = (bytes(16), bytes(12), bytes(16),
+            '0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf')
+
+
+def crypto_self_test():
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    pw, salt, params, want = _SCRYPT_KAT
+    if hashlib.scrypt(pw.encode(), salt=salt, **params).hex() != want:
+        raise SystemExit('scrypt known-answer test failed: refusing to run')
+    key, nonce, plain, want = _GCM_KAT
+    if AESGCM(key).encrypt(nonce, plain, None).hex() != want:
+        raise SystemExit('AES-GCM known-answer test failed: refusing to run')
+    if not hmac.compare_digest(hashlib.sha256(b'abc').hexdigest(),
+                               'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'):
+        raise SystemExit('SHA-256 known-answer test failed: refusing to run')
 
 
 # --- key derivation -------------------------------------------------------
@@ -92,11 +133,48 @@ def harden_process():
 _derive_lock = threading.Lock()
 
 
+def wipe(buf):
+    """Zero a bytearray in place; the one thing Python lets us scrub."""
+    for i in range(len(buf)):
+        buf[i] = 0
+
+
+def _libc():
+    import ctypes
+    return ctypes.CDLL('libc.so.6', use_errno=True)
+
+
+def _lock_pages(buf, lock=True):
+    """mlock the page holding a key bytearray so it is never written to swap.
+    Best effort: RLIMIT_MEMLOCK allows a few pages even for an unprivileged uid."""
+    import ctypes
+    try:
+        addr = ctypes.addressof((ctypes.c_char * len(buf)).from_buffer(buf))
+        fn = _libc().mlock if lock else _libc().munlock
+        return fn(ctypes.c_void_p(addr), ctypes.c_size_t(len(buf))) == 0
+    except Exception:
+        return False
+
+
+def _as_bytes(passphrase):
+    if isinstance(passphrase, (bytes, bytearray, memoryview)):
+        return passphrase
+    return passphrase.encode()
+
+
 def derive_key(passphrase, salt, params=None):
+    """The key as a bytearray, so whoever owns it can wipe() it. A str passphrase
+    and scrypt's own bytes result are immutable and stay in the heap until reused;
+    the CLI passes a bytearray it wipes, PR_SET_DUMPABLE=0 guards the rest."""
     params = params or KEY_SCRYPT
     # half a gig a go; serialise so concurrent logins cannot stack allocations
     with _derive_lock:
-        return bytearray(hashlib.scrypt(passphrase.encode(), salt=salt, **params))
+        return bytearray(hashlib.scrypt(_as_bytes(passphrase), salt=salt, **params))
+
+
+def _kdf_key(cfg, passphrase):
+    params = {k: cfg[k] for k in KDF_KEYS if k in cfg}
+    return derive_key(passphrase, bytes.fromhex(cfg['salt']), params or KEY_SCRYPT)
 
 
 def read_kdf():
@@ -106,14 +184,34 @@ def read_kdf():
     return bytes.fromhex(cfg['salt']), (params or KEY_SCRYPT)
 
 
-def write_kdf(salt, params=None):
-    KDF_FILE.write_text(json.dumps({'salt': salt.hex(), **(params or KEY_SCRYPT)}))
+def write_kdf(salt, params=None, previous=None):
+    """previous= keeps the old salt alongside while a rekey is mid-flight."""
+    cfg = {'salt': salt.hex(), **(params or KEY_SCRYPT)}
+    if previous:
+        cfg['previous'] = {k: previous[k] for k in ('salt', *KDF_KEYS) if k in previous}
+    KDF_FILE.write_text(json.dumps(cfg))
     KDF_FILE.chmod(0o600)
 
 
 def key_from_passphrase(passphrase):
     salt, params = read_kdf()
     return derive_key(passphrase, salt, params)
+
+
+def open_store(passphrase):
+    """(key, conn, kdf) for whichever salt opens the store: the current one, or
+    the previous one a rekey that died between its two writes left behind."""
+    cfg = json.loads(KDF_FILE.read_text())
+    error = None
+    for candidate in (cfg, cfg.get('previous')):
+        if not candidate:
+            continue
+        key = _kdf_key(candidate, passphrase)
+        try:
+            return key, _open_secrets(key), candidate
+        except Locked as exc:
+            error = exc
+    raise error
 
 
 # --- connections ----------------------------------------------------------
@@ -128,11 +226,14 @@ def deploy_conn():
 
 def _open_secrets(key, path=None, create=False):
     path = Path(path or SECRETS_DB)
+    # check_same_thread off: SecretStore serialises every use behind its own lock
+    # and is handed between request, scheduler and deploy threads
     if create:
-        conn = sqlcipher.connect(str(path), timeout=30)
+        conn = sqlcipher.connect(str(path), timeout=30, check_same_thread=False)
     else:
         # mode=rw so a wrong path errors instead of creating an empty store.
-        conn = sqlcipher.connect(f'file:{path}?mode=rw', uri=True, timeout=30)
+        conn = sqlcipher.connect(f'file:{path}?mode=rw', uri=True, timeout=30,
+                                 check_same_thread=False)
     conn.row_factory = sqlcipher.Row
     for pragma in CIPHER_PRAGMAS:
         conn.execute(pragma)
@@ -150,28 +251,28 @@ def _open_secrets(key, path=None, create=False):
 class SecretStore:
     """Owns the derived key and one serialised connection to secrets.db."""
 
-    def __init__(self, key):
-        self._key = bytearray(key)
+    def __init__(self, key, conn=None):
+        # takes ownership of a bytearray, so the only long-lived copy of the key
+        # is the one close() wipes
+        self._key = key if isinstance(key, bytearray) else bytearray(key)
+        self.locked_in_ram = _lock_pages(self._key)
         self._lock = threading.Lock()
-        self._conn = _open_secrets(self._key)
+        self._conn = conn or _open_secrets(self._key)
 
     @classmethod
     def unlock(cls, passphrase):
-        return cls(key_from_passphrase(passphrase))
+        key, conn, _ = open_store(passphrase)
+        return cls(key, conn)
 
-    @property
-    def key_hex(self):
-        return bytes(self._key).hex()
-
-    @classmethod
-    def from_key_hex(cls, key_hex):
-        return cls(bytes.fromhex(key_hex))
+    def clone(self):
+        """Own connection and key copy for a worker thread that outlives the request."""
+        return SecretStore(bytearray(self._key))
 
     def close(self):
         with self._lock:
             self._conn.close()
-        for i in range(len(self._key)):
-            self._key[i] = 0
+        wipe(self._key)
+        _lock_pages(self._key, lock=False)
 
     def _retry(self):
         self._conn = _open_secrets(self._key)
@@ -184,7 +285,7 @@ class SecretStore:
                     out = cur.fetchall() if fetch else None
                     self._conn.commit()
                     return out
-                except sqlcipher.DatabaseError:
+                except sqlcipher.OperationalError:
                     if attempt == 2:
                         raise
                     self._retry()
@@ -282,8 +383,11 @@ class SecretStore:
         """Write lock, so a byte copy of secrets.db is consistent."""
         return _WriteLock(self)
 
+    def backup_key(self):
+        return backup_key(self._key)
+
     def orphan_sweep(self):
-        """Drop secrets whose owning row is gone; rowids get reused."""
+        """Drop secrets whose owning row is gone: there is no foreign key across files."""
         with deploy_conn() as dc:
             projects = {r[0] for r in dc.execute('SELECT id FROM project')}
             envs = {r[0] for r in dc.execute('SELECT id FROM environment')}
@@ -311,7 +415,11 @@ class _WriteLock:
 
     def __enter__(self):
         self._store._lock.acquire()
-        self._store._conn.execute('BEGIN IMMEDIATE')
+        try:
+            self._store._conn.execute('BEGIN IMMEDIATE')
+        except BaseException:
+            self._store._lock.release()
+            raise
         return self
 
     def __exit__(self, *exc):
@@ -319,6 +427,29 @@ class _WriteLock:
             self._store._conn.execute('COMMIT')
         finally:
             self._store._lock.release()
+
+
+def backup_key(store_key):
+    """A subkey for sealing backups, so the database key itself never leaves SQLCipher."""
+    return hmac.new(bytes(store_key), b'slack-deploy backup', hashlib.sha256).digest()
+
+
+def seal(key, data, aad=b''):
+    """nonce || AES-256-GCM(data). Confidentiality and integrity in one: a tampered
+    or foreign blob fails to open rather than restoring quietly."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    nonce = os.urandom(12)
+    return nonce + AESGCM(key).encrypt(nonce, data, aad)
+
+
+def unseal(key, blob, aad=b''):
+    """Raises Locked when the key or the bytes are wrong."""
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    try:
+        return AESGCM(key).decrypt(blob[:12], blob[12:], aad)
+    except InvalidTag as exc:
+        raise Locked('wrong global password or a tampered backup') from exc
 
 
 def generate_ssh_key(comment='slack-deploy'):
@@ -356,7 +487,7 @@ def coerce_value(text, vartype='string'):
     if vartype == 'date':
         return date.fromisoformat(text)
     if vartype == 'yaml':
-        return yaml.safe_load(text)
+        return load_yaml(text)
     raise ValueError(f'unknown type: {vartype!r}')
 
 
@@ -381,8 +512,21 @@ def type_name(value):
 
 # --- vars YAML ------------------------------------------------------------
 
+class _NoAliasLoader(yaml.SafeLoader):
+    """An alias tree a few hundred bytes long expands to gigabytes when the merged
+    vars are copied into JSON for ansible, so user YAML may not use them."""
+    def compose_node(self, parent, index):
+        if self.check_event(yaml.AliasEvent):
+            raise yaml.YAMLError('YAML aliases (*name) are not allowed')
+        return super().compose_node(parent, index)
+
+
+def load_yaml(text):
+    return yaml.load(text, Loader=_NoAliasLoader)
+
+
 def vars_import(store, scope, scope_id, path, actor=None):
-    doc = yaml.safe_load(Path(path).read_text())
+    doc = load_yaml(Path(path).read_text())
     if not isinstance(doc, dict):
         raise ValueError('vars file must be a YAML mapping of name -> value')
     for name, value in doc.items():
@@ -397,13 +541,53 @@ def vars_export_text(store, scope, scope_id):
 
 # --- users ----------------------------------------------------------------
 
+def _pw(password, salt):
+    out = hashlib.scrypt(password.encode(), salt=salt, **PW_SCRYPT)
+    return out[:32], out[32:]
+
+
+def check_password_strength(password):
+    if len(password or '') < MIN_PASSWORD:
+        raise ValueError(f'password must be at least {MIN_PASSWORD} characters')
+
+
 def hash_password(password, salt=None):
     salt = salt or os.urandom(16)
-    return hashlib.scrypt(password.encode(), salt=salt, **PW_SCRYPT), salt
+    return _pw(password, salt)[0], salt
 
 
 def check_password(password, pw_hash, salt):
-    return hmac.compare_digest(hash_password(password, salt)[0], pw_hash)
+    """The TOTP wrapping key on success, None otherwise."""
+    verifier, wrap = _pw(password, salt)
+    return wrap if hmac.compare_digest(verifier, pw_hash) else None
+
+
+TOTP_WRAPPED = 'v1:'
+
+
+def wrap_totp(secret, wrap_key):
+    """The seed lives in the plaintext database, so it is sealed under a key only
+    the user's password yields: a stolen deploy.db is not a second factor."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    nonce = os.urandom(12)
+    box = AESGCM(bytes(wrap_key)).encrypt(nonce, secret.encode(), b'totp')
+    return TOTP_WRAPPED + base64.b64encode(nonce + box).decode()
+
+
+def unwrap_totp(stored, wrap_key):
+    """None when there is no seed or the key does not fit. A bare (unwrapped) seed
+    from before sealing is returned as is; the login re-wraps it."""
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    if not stored:
+        return None
+    if not stored.startswith(TOTP_WRAPPED):
+        return stored
+    raw = base64.b64decode(stored[len(TOTP_WRAPPED):])
+    try:
+        return AESGCM(bytes(wrap_key)).decrypt(raw[:12], raw[12:], b'totp').decode()
+    except InvalidTag:
+        return None
 
 
 # --- TOTP (RFC 6238, stdlib only) -----------------------------------------
@@ -457,7 +641,12 @@ def totp_uri(secret, username, issuer='slack-deploy'):
 # --- audit ----------------------------------------------------------------
 
 def audit(actor, action, detail=None):
-    """Never record secret values here - names and ids only."""
+    """Never record secret values here - names and ids only. Also written to the
+    process log: the audit table lives in deploy.db, which whoever owns the uid
+    can edit, so a collector off the box is the copy that counts."""
+    # one line per event, whatever a username contains, so a log cannot be forged
+    logging.getLogger('audit').info('%s %s %s', *(re.sub(r'\s+', ' ', str(v))
+                                                  for v in (actor, action, detail or '')))
     with deploy_conn() as conn:
         conn.execute('INSERT INTO audit (actor, action, detail) VALUES (?,?,?)',
                      (actor, action, detail))
@@ -499,16 +688,20 @@ def init(passphrase):
 
 
 def rekey(old_passphrase, new_passphrase):
-    """Never PRAGMA rekey: it rewrites every page and is not crash-atomic."""
+    """Never PRAGMA rekey: it rewrites every page and is not crash-atomic.
+
+    Build the new file beside the old, then swap. kdf.json carries both salts
+    until the swap is done, so a crash anywhere leaves a store one of the two
+    passphrases still opens (see open_store)."""
     if len(new_passphrase) < MIN_PASSPHRASE:
         raise ValueError(f'global password must be at least {MIN_PASSPHRASE} characters')
-    old_key = key_from_passphrase(old_passphrase)
-    conn = _open_secrets(old_key)
+    old_key, conn, old_cfg = open_store(old_passphrase)
     new_salt = os.urandom(16)
     new_key = derive_key(new_passphrase, new_salt)
     tmp = SECRETS_DB.with_suffix('.rekey')
     tmp.unlink(missing_ok=True)
     try:
+        write_kdf(new_salt, previous=old_cfg)
         conn.execute('ATTACH DATABASE ? AS fresh KEY "x\'%s\'"' % bytes(new_key).hex(),
                      (str(tmp),))
         conn.execute("SELECT sqlcipher_export('fresh')")
@@ -519,4 +712,7 @@ def rekey(old_passphrase, new_passphrase):
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
+    finally:
+        wipe(old_key)
+        wipe(new_key)
     write_kdf(new_salt)  # also upgrades an old store to today's KDF params

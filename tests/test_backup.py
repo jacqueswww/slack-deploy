@@ -13,20 +13,30 @@ import scheduler
 STORE = None
 
 
+def payload_names(path, passphrase=GOOD):
+    _, payload = scheduler.open_backup(path, passphrase)
+    with payload as zf:
+        return sorted(zf.namelist())
+
+
 def backup_covers_the_whole_data_dir():
     global STORE
     STORE = harness.new_store()
     STORE.set(db.GLOBAL_SCOPE, 0, 'slack_bot_token', 'xoxb-must-not-leak')
     STORE.set('environment', 1, 'pg_password', 'hunter2-in-the-clear')
+    with db.deploy_conn() as conn:
+        conn.execute("INSERT INTO user (username, pw_hash, pw_salt, totp_secret) "
+                     "VALUES ('carol', x'00', x'00', 'PLAINTEXTSEED')")
     # a stray file a later version might drop in, and a live deploy's temp file
     (db.DATA / 'notes.txt').write_text('keep me')
     (db.RUN_DIR / 'inflight.yml').write_text('pg: plaintext-in-flight')
     path, _ = scheduler.backup(STORE)
     with zipfile.ZipFile(path) as zf:
-        names = sorted(zf.namelist())
-        blob = zf.read('secrets.db')
-    assert names == ['deploy.db', 'kdf.json', 'notes.txt', 'secrets.db'], names
-    assert b'hunter2' not in blob, 'secrets.db must stay encrypted inside the zip'
+        assert sorted(zf.namelist()) == ['data.enc', 'kdf.json'], zf.namelist()
+    assert payload_names(path) == ['deploy.db', 'notes.txt', 'secrets.db']
+    raw = path.read_bytes()
+    for leak in (b'hunter2', b'PLAINTEXTSEED', b'carol', b'SQLite format 3', b'keep me'):
+        assert leak not in raw, f'{leak} readable in the backup without the password'
     assert path.stat().st_mode & 0o777 == 0o600, oct(path.stat().st_mode)
     (db.RUN_DIR / 'inflight.yml').unlink()
 
@@ -37,8 +47,7 @@ def run_dir_is_excluded():
     (db.RUN_DIR / 'inflight.yml').write_text('pg: plaintext-in-flight')
     try:
         path, _ = scheduler.backup(STORE)
-        with zipfile.ZipFile(path) as zf:
-            assert 'inflight.yml' not in zf.namelist(), zf.namelist()
+        assert 'inflight.yml' not in payload_names(path)
     finally:
         (db.RUN_DIR / 'inflight.yml').unlink()
 
@@ -53,8 +62,10 @@ def a_backup_alone_can_be_restored():
     """kdf.json carries the salt; without it the passphrase cannot become a key."""
     path, _ = scheduler.backup(STORE)
     restored = WORK / 'restored'
-    with zipfile.ZipFile(path) as zf:
+    kdf, payload = scheduler.open_backup(path, GOOD)
+    with payload as zf:
         zf.extractall(restored)
+    (restored / 'kdf.json').write_bytes(kdf)
     saved = (db.DATA, db.DEPLOY_DB, db.SECRETS_DB, db.KDF_FILE)
     try:
         db.DATA, db.DEPLOY_DB = restored, restored / 'deploy.db'
@@ -70,12 +81,40 @@ def retention_prunes_by_date():
     old = db.BACKUP_DIR / f'{date.today() - timedelta(days=91)}.zip'
     keep = db.BACKUP_DIR / f'{date.today() - timedelta(days=89)}.zip'
     junk = db.BACKUP_DIR / 'not-a-date.zip'
-    for f in (old, keep, junk):
+    stale_partial = db.BACKUP_DIR / f'{date.today() - timedelta(days=1)}.partial'
+    stale_staging = db.BACKUP_DIR / f'.staging-{date.today() - timedelta(days=1)}'
+    todays_partial = db.BACKUP_DIR / f'{date.today()}.partial'
+    for f in (old, keep, junk, stale_partial, todays_partial):
         f.write_bytes(b'x')
+    stale_staging.mkdir()
+    with db.deploy_conn() as conn:
+        old_job = conn.execute("INSERT INTO job (kind, status, started_at) VALUES "
+                               "('deploy','ok', date('now','-91 days'))").lastrowid
+        new_job = conn.execute("INSERT INTO job (kind, status) VALUES ('deploy','ok')"
+                               ).lastrowid
     removed = scheduler.prune()
     assert old.name in removed, removed
     assert keep.exists(), '89 days old is inside the 90 day window'
     assert junk.exists(), 'a file that is not a date should be left alone'
+    assert not stale_partial.exists() and not stale_staging.exists(), \
+        'debris of a killed backup must go'
+    assert todays_partial.exists(), 'a backup in flight right now must be left alone'
+    todays_partial.unlink()
+    with db.deploy_conn() as conn:
+        left = {r[0] for r in conn.execute('SELECT id FROM job')}
+    assert old_job not in left and new_job in left, 'job logs follow the same retention'
+
+
+def schedule_inputs_must_be_canonical():
+    scheduler.validate('02:00', '*')
+    scheduler.validate('23:59', '0,6')
+    for at, days in (('2:00', '*'), ('24:00', '*'), ('02:00', '7'), ('02:00', 'mon'),
+                     ('', '*')):
+        try:
+            scheduler.validate(at, days)
+            raise AssertionError(f'{at!r} {days!r} must be refused')
+        except ValueError:
+            pass
 
 
 def schedule_fires_once_a_day():
@@ -105,9 +144,81 @@ def only_one_process_owns_the_scheduler():
     assert scheduler._elected(1234), 'the holder keeps it on the next tick'
 
 
+def restore_refuses_while_the_bot_runs():
+    path, _ = scheduler.backup(STORE)
+    try:
+        scheduler.restore(path, GOOD)
+        raise AssertionError('a live heartbeat means open files; restore must refuse')
+    except RuntimeError:
+        pass
+    assert db.DATA.exists() and not (db.DATA.parent / '.restoring-data').exists()
+
+
+def restore_refuses_a_zip_that_is_not_a_backup():
+    bogus = WORK / 'bogus.zip'
+    with zipfile.ZipFile(bogus, 'w') as zf:
+        zf.writestr('deploy.db', b'x')
+    try:
+        scheduler.restore(bogus, GOOD)
+        raise AssertionError('a plain zip must be refused')
+    except ValueError:
+        pass
+
+
+def a_tampered_or_foreign_backup_refuses_to_restore():
+    """The seal is the only thing standing between a doctored deploy.db (a new admin,
+    a project pointed at a hostile repo) and the next Slack deploy."""
+    path, _ = scheduler.backup(STORE)
+    try:
+        scheduler.open_backup(path, 'not the passphrase at all')
+        raise AssertionError('the wrong global password must not open a backup')
+    except db.Locked:
+        pass
+    with zipfile.ZipFile(path) as zf:
+        kdf, blob = zf.read('kdf.json'), bytearray(zf.read('data.enc'))
+    blob[40] ^= 0x01
+    forged = WORK / 'forged.zip'
+    with zipfile.ZipFile(forged, 'w') as zf:
+        zf.writestr('kdf.json', kdf)
+        zf.writestr('data.enc', bytes(blob))
+    try:
+        scheduler.restore(forged, GOOD)
+        raise AssertionError('one flipped bit must be refused')
+    except db.Locked:
+        pass
+    assert db.DATA.exists() and not (db.DATA.parent / '.restoring-data').exists()
+
+
+def restore_swaps_the_data_dir_and_keeps_the_old_one():
+    """The zip wins, the previous state survives as a directory beside it."""
+    path, _ = scheduler.backup(STORE)
+    STORE.set(db.GLOBAL_SCOPE, 0, 'added_after_backup', 'gone-after-restore')
+    (db.DATA / 'notes.txt').unlink()
+    STORE.close()                                  # "stop the bot"
+    with db.deploy_conn() as conn:
+        conn.execute("UPDATE scheduler_lock SET heartbeat_at=datetime('now','-1 hour')")
+    old = scheduler.restore(path, GOOD)
+    assert old.exists() and (old / 'secrets.db').exists(), old
+    assert old.stat().st_mode & 0o777 == 0o700
+    assert (db.DATA / 'notes.txt').read_text() == 'keep me', 'extra files come back too'
+    assert (db.DATA / 'run').is_dir()
+    assert db.DATA.stat().st_mode & 0o777 == 0o700
+    assert (db.DATA / 'secrets.db').stat().st_mode & 0o777 == 0o600
+    back = db.SecretStore.unlock(GOOD)
+    try:
+        assert back.get(db.GLOBAL_SCOPE, 0, 'slack_bot_token') == 'xoxb-must-not-leak'
+        assert back.get(db.GLOBAL_SCOPE, 0, 'added_after_backup') is None
+    finally:
+        back.close()
+
+
 if __name__ == '__main__':
     sys.exit(harness.run(
         backup_covers_the_whole_data_dir, run_dir_is_excluded,
         backups_live_beside_data_not_inside_it, a_backup_alone_can_be_restored,
-        retention_prunes_by_date, schedule_fires_once_a_day,
-        schedule_honours_weekdays, only_one_process_owns_the_scheduler))
+        retention_prunes_by_date, schedule_inputs_must_be_canonical,
+        schedule_fires_once_a_day,
+        schedule_honours_weekdays, only_one_process_owns_the_scheduler,
+        restore_refuses_while_the_bot_runs, restore_refuses_a_zip_that_is_not_a_backup,
+        a_tampered_or_foreign_backup_refuses_to_restore,
+        restore_swaps_the_data_dir_and_keeps_the_old_one))

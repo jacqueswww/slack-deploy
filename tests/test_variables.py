@@ -85,8 +85,8 @@ def environment_scope_wins():
     assert STORE.extra_vars(1, 99)['shared'] == 'from-environment'
 
 
-def orphan_sweep_stops_id_reuse():
-    """SQLite reuses rowids and scope_id has no cross-file foreign key."""
+def orphan_sweep_drops_secrets_of_deleted_rows():
+    """scope_id has no cross-file foreign key, so deletions must be swept by hand."""
     global PROJECT_ID
     with db.deploy_conn() as conn:
         PROJECT_ID = conn.execute(
@@ -107,6 +107,26 @@ def orphan_sweep_stops_id_reuse():
         'it should also drop secrets whose scope row never existed'
 
 
+def yaml_aliases_are_refused():
+    """A few hundred bytes of nested aliases expand to gigabytes when copied to JSON."""
+    bomb = 'a: &a [x, x]\nb: &b [*a, *a]\nc: [*b, *b]\n'
+    for attempt in (lambda: db.coerce_value(bomb, 'yaml'),
+                    lambda: db.load_yaml(bomb)):
+        try:
+            attempt()
+            raise AssertionError('aliases must be refused')
+        except yaml.YAMLError:
+            pass
+    bad = WORK / 'bomb.yml'
+    bad.write_text(bomb)
+    try:
+        db.vars_import(STORE, 'project', 1, bad)
+        raise AssertionError('aliases must be refused on import too')
+    except yaml.YAMLError:
+        pass
+    assert db.load_yaml('a: 1\nb: [1, 2]\n') == {'a': 1, 'b': [1, 2]}
+
+
 def import_rejects_a_non_mapping():
     bad = WORK / 'bad.yml'
     bad.write_text('- just\n- a\n- list\n')
@@ -121,5 +141,5 @@ if __name__ == '__main__':
     sys.exit(harness.run(
         yaml_types_round_trip, explicit_types_beat_bare_yaml, stored_type_is_reported,
         notes_live_beside_the_value, global_scope_never_reaches_ansible,
-        environment_scope_wins, orphan_sweep_stops_id_reuse,
-        import_rejects_a_non_mapping))
+        environment_scope_wins, orphan_sweep_drops_secrets_of_deleted_rows,
+        yaml_aliases_are_refused, import_rejects_a_non_mapping))

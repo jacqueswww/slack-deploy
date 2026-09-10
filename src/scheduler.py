@@ -1,18 +1,24 @@
 """One poller thread that spawns a worker per due schedule row."""
+import io
+import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import threading
 import zipfile
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
-from db import BACKUP_DIR, DATA, DEPLOY_DB, RUN_DIR, SECRETS_DB, deploy_conn
+import db
+from db import BACKUP_DIR, DATA, DEPLOY_DB, KDF_FILE, RUN_DIR, SECRETS_DB, deploy_conn
 import runner
 
 logger = logging.getLogger(__name__)
 
 POLL_SECONDS = 60
+KINDS = ('backup', 'git-pull')
 HEARTBEAT_STALE = '-180 seconds'
 RETENTION_DAYS = 90
 
@@ -20,13 +26,15 @@ SNAPSHOTTED = {DEPLOY_DB.name, SECRETS_DB.name}
 # run/ holds the plaintext extra-vars of a deploy that is mid-flight
 SKIP_DIRS = {RUN_DIR.name}
 SKIP_SUFFIXES = ('-wal', '-shm', '-journal', '.partial', '.rekey', '.staging')
+REQUIRED = ('deploy.db', 'secrets.db')   # inside the sealed payload
+SEALED = 'data.enc'
 
 
 def extra_files():
-    """Everything else under data/ - kdf.json is the one a restore cannot skip."""
+    """Everything else under data/, bar kdf.json which travels in the clear."""
     for item in sorted(DATA.rglob('*')):
         rel = item.relative_to(DATA)
-        if not item.is_file() or rel.parts[0] in SKIP_DIRS:
+        if not item.is_file() or rel.parts[0] in SKIP_DIRS or rel.name == KDF_FILE.name:
             continue
         if rel.name in SNAPSHOTTED or rel.name.endswith(SKIP_SUFFIXES):
             continue
@@ -35,13 +43,17 @@ def extra_files():
 
 # --- backups --------------------------------------------------------------
 
-def backup(store=None, day=None):
-    """One zip per day of the whole data dir, bar backups/ and run/.
+def backup(store, day=None):
+    """One zip per day: kdf.json in the clear beside one AES-GCM sealed payload.
 
-    secrets.db goes in still SQLCipher-encrypted; kdf.json carries the salt and
-    KDF params, without which the passphrase cannot be turned back into a key.
+    The payload holds deploy.db (users, job logs), secrets.db (still SQLCipher
+    encrypted) and anything else under data/ bar run/. It is sealed under a subkey
+    of the store key, so a copied backup yields nothing without the global
+    password and a tampered one refuses to restore. kdf.json stays outside
+    because it carries the salt the password needs to become that key again.
     """
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUP_DIR.chmod(0o700)
     day = day or date.today().isoformat()
     zip_path = BACKUP_DIR / f'{day}.zip'
     staged = BACKUP_DIR / f'.staging-{day}'
@@ -52,24 +64,19 @@ def backup(store=None, day=None):
         snap.unlink(missing_ok=True)
         with sqlite3.connect(DEPLOY_DB) as conn:
             conn.execute('VACUUM INTO ?', (str(snap),))
-        if SECRETS_DB.exists():
-            if store is not None:
-                with store.begin_immediate():
-                    shutil.copy2(SECRETS_DB, staged / 'secrets.db')
-            else:
-                # no key here, so no write lock; take the journal too, which
-                # makes even a copy caught mid-write recoverable
-                shutil.copy2(SECRETS_DB, staged / 'secrets.db')
-                for suffix in ('-journal', '-wal', '-shm'):
-                    side = SECRETS_DB.with_name(SECRETS_DB.name + suffix)
-                    if side.exists():
-                        shutil.copy2(side, staged / side.name)
-        tmp_zip = zip_path.with_suffix('.partial')
-        with zipfile.ZipFile(tmp_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
+        with store.begin_immediate():
+            shutil.copy2(SECRETS_DB, staged / 'secrets.db')
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, 'w', zipfile.ZIP_DEFLATED) as zf:
             for item in sorted(staged.iterdir()):
                 zf.write(item, item.name)
             for item, rel in extra_files():
                 zf.write(item, str(rel))
+        kdf = KDF_FILE.read_bytes()
+        tmp_zip = zip_path.with_suffix('.partial')
+        with zipfile.ZipFile(tmp_zip, 'w') as zf:
+            zf.writestr(KDF_FILE.name, kdf)
+            zf.writestr(SEALED, db.seal(store.backup_key(), payload.getvalue(), aad=kdf))
         tmp_zip.chmod(0o600)
         tmp_zip.replace(zip_path)
     finally:
@@ -78,21 +85,114 @@ def backup(store=None, day=None):
     return zip_path, pruned
 
 
+def open_backup(zip_path, passphrase):
+    """(kdf.json bytes, ZipFile of the payload). Tries the previous salt too, for a
+    backup taken while a rekey was mid-flight."""
+    with zipfile.ZipFile(zip_path) as zf:
+        if sorted(zf.namelist()) != sorted([KDF_FILE.name, SEALED]):
+            raise ValueError(f'{zip_path} is not a slack-deploy backup')
+        kdf, blob = zf.read(KDF_FILE.name), zf.read(SEALED)
+    cfg = json.loads(kdf)
+    error = None
+    for candidate in (cfg, cfg.get('previous')):
+        if not candidate:
+            continue
+        key = db._kdf_key(candidate, passphrase)
+        try:
+            plain = db.unseal(db.backup_key(key), blob, aad=kdf)
+            return kdf, zipfile.ZipFile(io.BytesIO(plain))
+        except db.Locked as exc:
+            error = exc
+        finally:
+            db.wipe(key)
+    raise error
+
+
+def _stamp(name):
+    """Date a backup name starts with: 2026-01-05, 2026-01-05-143000, 2026-01-05-pre-restore."""
+    try:
+        return date.fromisoformat(name.removeprefix('.staging-')[:10])
+    except ValueError:
+        return None
+
+
 def prune(days=RETENTION_DAYS, today=None):
-    cutoff = (today or date.today()) - timedelta(days=days)
+    """Old zips, old job logs, and the debris of a backup that was killed mid-way."""
+    today = today or date.today()
+    cutoff = today - timedelta(days=days)
     removed = []
     for item in BACKUP_DIR.glob('*.zip'):
-        try:
-            stamp = date.fromisoformat(item.stem)
-        except ValueError:
-            continue
-        if stamp < cutoff:
+        stamp = _stamp(item.stem)
+        if stamp and stamp < cutoff:
             item.unlink()
             removed.append(item.name)
+    for item in BACKUP_DIR.glob('.staging-*'):
+        if _stamp(item.name) != today:
+            shutil.rmtree(item, ignore_errors=True)
+    for item in BACKUP_DIR.glob('*.partial'):
+        if _stamp(item.stem) != today:
+            item.unlink()
+    with deploy_conn() as conn:
+        conn.execute('DELETE FROM job WHERE started_at < ?', (cutoff.isoformat(),))
     return removed
 
 
+# --- restore --------------------------------------------------------------
+
+def scheduler_alive():
+    """A fresh heartbeat means the bot is up and has the old files open."""
+    if not DEPLOY_DB.exists():
+        return False
+    with deploy_conn() as conn:
+        row = conn.execute("SELECT 1 FROM scheduler_lock WHERE heartbeat_at > "
+                           "datetime('now', ?)", (HEARTBEAT_STALE,)).fetchone()
+    return bool(row)
+
+
+def restore(zip_path, passphrase):
+    """Replace data/ with a backup zip. The old directory is kept beside the new
+    one as data.replaced-<stamp>; returns it, or None on a machine without data/."""
+    zip_path = Path(zip_path)
+    kdf, payload = open_backup(zip_path, passphrase)
+    with payload as zf:
+        missing = [n for n in REQUIRED if n not in zf.namelist()]
+        if missing or zf.testzip():
+            raise ValueError(f'{zip_path} is not a complete backup (missing {missing})')
+        staged = DATA.parent / f'.restoring-{DATA.name}'
+        shutil.rmtree(staged, ignore_errors=True)
+        staged.mkdir(mode=0o700, parents=True)
+        zf.extractall(staged)      # zipfile strips ../ and leading / itself
+    (staged / KDF_FILE.name).write_bytes(kdf)
+    for item in staged.rglob('*'):
+        item.chmod(0o700 if item.is_dir() else 0o600)
+    conn = sqlite3.connect(staged / 'deploy.db')
+    try:
+        if conn.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+            raise ValueError(f'{zip_path}: deploy.db fails its integrity check')
+    finally:
+        conn.close()
+    (staged / RUN_DIR.name).mkdir(mode=0o700, exist_ok=True)
+    if scheduler_alive():
+        shutil.rmtree(staged, ignore_errors=True)
+        raise RuntimeError('the bot is running and holds the current files open; '
+                           'stop it (and the web app) first')
+    old = None
+    if DATA.exists():
+        old = DATA.parent / f'{DATA.name}.replaced-{datetime.now():%Y%m%d-%H%M%S}'
+        os.rename(DATA, old)
+    os.rename(staged, DATA)
+    return old
+
+
 # --- due logic (pure, so it is testable) ----------------------------------
+
+def validate(at_time, weekdays):
+    """is_due compares both as text, so they must be canonical: 02:00 not 2:00."""
+    if not re.fullmatch(r'([01]\d|2[0-3]):[0-5]\d', at_time or ''):
+        raise ValueError(f'time must be HH:MM: {at_time!r}')
+    if weekdays != '*' and not set(weekdays.split(',')) <= set('0123456'):
+        raise ValueError(f'weekdays must be * or 0-6 comma separated: {weekdays!r}')
+
 
 def is_due(row, now):
     if not row['enabled']:
@@ -152,6 +252,9 @@ def _dispatch(row, store):
                     sql += ' WHERE id=?'
                     args = (row['target_id'],)
                 projects = [dict(r) for r in conn.execute(sql, args)]
+            if not projects:
+                logger.warning('schedule %s: no project matches target %s',
+                               row['id'], row['target_id'])
             for project in projects:
                 runner.git_sync(project, store, actor='scheduler')
         else:

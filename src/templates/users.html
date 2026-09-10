@@ -7,17 +7,16 @@
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <input type="hidden" name="id" value="{{ u.id }}">
 <input name="slack_user_id" value="{{ u.slack_user_id or '' }}" placeholder="slack id" size="12">
-<input name="password" type="password" placeholder="new password" size="12">
+<input name="password" type="password" placeholder="new password (resets 2FA)" size="12" minlength="12">
 <label><input type="checkbox" name="is_admin" value="1" {% if u.is_admin %}checked{% endif %}>admin</label>
 <label><input type="checkbox" name="disabled" value="1" {% if u.disabled %}checked{% endif %}>disabled</label>
-<button>Save</button><button name="delete" value="1"
- onclick="return confirm('Delete this user?')">Delete</button></form>{% endif %}</td></tr>
+<button>Save</button><button name="delete" value="1" data-confirm="Delete this user?">Delete</button></form>{% endif %}</td></tr>
 {% endfor %}</table>
 {% if is_admin %}<fieldset><legend>New user</legend>
 <form method="post" action="/users">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <label>Username <input name="username" required></label>
-<label>Password <input name="password" type="password" required></label>
+<label>Password <input name="password" type="password" required minlength="12"></label>
 <label>Slack ID <input name="slack_user_id" size="12"></label>
 <label><input type="checkbox" name="is_admin" value="1">admin</label>
 <button>Create</button></form></fieldset>{% endif %}

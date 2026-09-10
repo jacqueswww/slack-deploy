@@ -7,7 +7,7 @@
 <td>{{ e.inventory }} {{ e.playbook }}{% if e.become %} -b{% endif %}</td>
 <td>{{ e.tags or '' }}</td>
 <td><a href="/secrets?scope=environment&scope_id={{ e.id }}">vars</a></td>
-<td><form method="post" action="/deploy" style="display:inline">
+<td><form method="post" action="/deploy" class="inline">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <input type="hidden" name="environment_id" value="{{ e.id }}">
 <button>Deploy</button></form>
@@ -22,7 +22,7 @@
 {% for p in projects %}<tr><td>{{ p.name }}</td><td>{{ p.working_dir }}</td>
 <td>{{ p.branch }}</td><td>{{ p.git_remote or '' }}</td>
 <td><a href="/secrets?scope=project&scope_id={{ p.id }}">vars</a></td>
-<td>{% if p.git_remote %}<form method="post" action="/sync" style="display:inline">
+<td>{% if p.git_remote %}<form method="post" action="/sync" class="inline">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <input type="hidden" name="project_id" value="{{ p.id }}">
 <button>Sync</button></form> {% endif %}<a href="/project?id={{ p.id }}">edit</a></td></tr>

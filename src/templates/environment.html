@@ -15,7 +15,6 @@
 <p><label><input type="checkbox" name="become" value="1"
   {% if env and env.become %}checked{% endif %}> become (-b)</label></p>
 <button>Save</button>
-{% if env %}<button name="delete" value="1"
-  onclick="return confirm('Delete this environment and its secrets?')">Delete</button>{% endif %}
+{% if env %}<button name="delete" value="1" data-confirm="Delete this environment and its secrets?">Delete</button>{% endif %}
 </fieldset></form><p><a href="/">back</a></p>
 {% endblock %}

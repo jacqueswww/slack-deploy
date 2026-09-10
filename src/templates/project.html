@@ -13,8 +13,7 @@
 <span class="mask">HTTPS uses the read-only github_pat credential; SSH uses the
 daemon user's own key. Leave blank if you check the repo out by hand.</span></p>
 <button>Save</button>
-{% if project %}<button name="delete" value="1"
-  onclick="return confirm('Delete this project, its environments and their secrets?')"
+{% if project %}<button name="delete" value="1" data-confirm="Delete this project, its environments and their secrets?"
   >Delete</button>{% endif %}
 </fieldset></form><p><a href="/">back</a></p>
 {% endblock %}

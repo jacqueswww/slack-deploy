@@ -3,10 +3,12 @@
 import argparse
 import configparser
 import getpass
+import logging
 import os
 import shlex
 import stat
 import sys
+import termios
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -17,21 +19,74 @@ import runner      # noqa: E402
 import scheduler   # noqa: E402
 
 
-def ask_passphrase(prompt='Global password: ', confirm=False):
-    value = getpass.getpass(prompt)
-    if confirm and value != getpass.getpass('Repeat: '):
-        raise SystemExit('passwords did not match')
+def read_secret(prompt):
+    """Like getpass, but into a bytearray the caller can wipe. The bot lives for
+    weeks holding the derived key; the passphrase itself must not sit beside it
+    in the heap that whole time. Piped stdin (CI) falls back to getpass."""
+    try:
+        fd = os.open('/dev/tty', os.O_RDWR)
+    except OSError:
+        return bytearray(getpass.getpass(prompt).encode())
+    old = termios.tcgetattr(fd)
+    new = old[:]
+    new[3] &= ~termios.ECHO
+    buf = bytearray()
+    try:
+        os.write(fd, prompt.encode())
+        termios.tcsetattr(fd, termios.TCSAFLUSH, new)
+        while True:
+            ch = os.read(fd, 1)
+            if not ch or ch in (b'\n', b'\r'):
+                break
+            buf += ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSAFLUSH, old)
+        os.write(fd, b'\n')
+        os.close(fd)
+    return buf
+
+
+def ask_passphrase(prompt='Global password: ', confirm=False, minimum=None):
+    value = read_secret(prompt)
+    if minimum and len(value) < minimum:
+        db.wipe(value)
+        raise SystemExit(f'must be at least {minimum} characters')
+    if confirm:
+        again = read_secret('Repeat: ')
+        same = again == value
+        db.wipe(again)
+        if not same:
+            db.wipe(value)
+            raise SystemExit('passwords did not match')
     return value
+
+
+def ask_password(*args, **kwargs):
+    """A user password: hashed at once, then wiped."""
+    value = ask_passphrase(*args, **kwargs)
+    try:
+        return db.hash_password(bytes(value).decode())
+    finally:
+        db.wipe(value)
 
 
 def unlock():
     db.harden_process()
     if not db.KDF_FILE.exists():
         raise SystemExit('not initialised - run: python manage.py init')
+    passphrase = ask_passphrase()
     try:
-        return db.SecretStore.unlock(ask_passphrase())
+        return db.SecretStore.unlock(passphrase)
     except db.Locked:
         raise SystemExit('incorrect global password')
+    finally:
+        db.wipe(passphrase)
+
+
+def require_migrated(conn, kind):
+    """Refuse to start on an old schema: a missing column is a 500 at 3am otherwise."""
+    if db.pending(conn, kind):
+        raise SystemExit(f'{kind}.db has pending migrations - run: make migrate')
 
 
 def scope_of(args):
@@ -61,14 +116,18 @@ def cmd_init(args):
         for path in found:
             print(f'  {path}', file=sys.stderr)
         raise SystemExit(db.REFUSE_INIT)
-    store = db.init(ask_passphrase('New global password: ', confirm=True))
+    passphrase = ask_passphrase('New global password: ', confirm=True)
+    try:
+        store = db.init(passphrase)
+    finally:
+        db.wipe(passphrase)
     print(f'initialised {db.DATA}')
     with db.deploy_conn() as conn:
         existing = conn.execute('SELECT count(*) c FROM user').fetchone()['c']
     if not existing:
         username = input('First admin username: ').strip()
-        pw_hash, salt = db.hash_password(ask_passphrase(f'Password for {username}: ',
-                                                        confirm=True))
+        pw_hash, salt = ask_password(f'Password for {username}: ', confirm=True,
+                                     minimum=db.MIN_PASSWORD)
         with db.deploy_conn() as conn:
             conn.execute('INSERT INTO user (username, pw_hash, pw_salt, is_admin) '
                          'VALUES (?,?,?,1)', (username, pw_hash, salt))
@@ -102,10 +161,17 @@ def cmd_doctor(args):
             problems.append(f'{label} readable by others ({oct(stat.S_IMODE(st.st_mode))}): {path}')
 
     check(db.DATA, 0, 'data dir')
+    check(db.BACKUP_DIR, 0, 'backup dir')
     for f in (db.DEPLOY_DB, db.SECRETS_DB, db.KDF_FILE):
         check(f, 0, 'file')
     if ROOT.stat().st_mode & 0o022:
         problems.append(f'checkout is group/other writable: {ROOT}')
+    # a playbook runs as this uid; if this uid can rewrite the code or the venv, one
+    # bad deploy trojans the process that is next handed the global password
+    for path in (ROOT / 'manage.py', ROOT / 'src', ROOT / 'venv'):
+        if path.exists() and os.access(path, os.W_OK):
+            problems.append(f'code writable by the uid that runs it (a compromised '
+                            f'playbook can trojan it): {path}')
     if not Path(runner.ANSIBLE_PLAYBOOK).exists():
         problems.append(f'ansible-playbook not found at {runner.ANSIBLE_PLAYBOOK}')
     if not Path(runner.GIT).exists():
@@ -120,6 +186,7 @@ def cmd_doctor(args):
                     problems.append(f"project {row['name']}: checkout writable by "
                                     f'others, anyone who can edit it receives that '
                                     f"project's secrets: {wd}")
+    problems += host_posture()
     print(f'running as uid {uid} ({getpass.getuser()}), data dir {db.DATA}')
     print('NOTE: encryption only protects a stolen database file unless this uid is '
           'separate from the accounts people log in as.')
@@ -129,22 +196,73 @@ def cmd_doctor(args):
     return 1 if problems else 0
 
 
+def _read(path):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return None
+
+
+def host_posture():
+    """Kernel and hardware settings the key's safety leans on. See THREAT-MODEL.md."""
+    out = []
+    vulns = Path('/sys/devices/system/cpu/vulnerabilities')
+    exposed = [f.name for f in sorted(vulns.glob('*')) if (_read(f) or '').startswith('Vulnerable')]
+    if exposed:
+        out.append('CPU side channels unmitigated by the kernel (key material in cache '
+                   f'is readable by any local process): {", ".join(exposed)}')
+    scope = _read('/proc/sys/kernel/yama/ptrace_scope')
+    if scope is not None and scope == '0':
+        out.append('kernel.yama.ptrace_scope=0: any same-uid process may ptrace another '
+                   '(PR_SET_DUMPABLE=0 covers this process, but set it to 1 or higher)')
+    if _read('/proc/sys/kernel/randomize_va_space') not in (None, '2'):
+        out.append('kernel.randomize_va_space is not 2: ASLR weakened')
+    swaps = [line.split()[0] for line in (_read('/proc/swaps') or '').splitlines()[1:]
+             if not line.startswith('/dev/zram')]     # zram is RAM, not a disk
+    if swaps:
+        out.append('swap on disk: pages holding the derived key or plaintext vars can '
+                   'reach it unless it is encrypted (or use zram / no swap): '
+                   + ', '.join(swaps))
+    if Path('/sys/kernel/iommu_groups').exists() and not any(Path('/sys/kernel/iommu_groups').iterdir()):
+        out.append('no IOMMU groups: DMA from a hostile PCIe/Thunderbolt device can read '
+                   'RAM (enable intel_iommu=on / amd_iommu=on)')
+    if _read('/proc/sys/kernel/dmesg_restrict') == '0':
+        out.append('kernel.dmesg_restrict=0: kernel addresses and device state readable by '
+                   'every user')
+    if not list(Path('/etc/systemd/system').glob('slack-deploy*.service')):
+        out.append('no slack-deploy unit installed: the units in deploy/ make src/, venv/ '
+                   'and the rest of the filesystem read-only to the daemon')
+    return out
+
+
 def cmd_bot(args):
     import bot
-    bot.run(unlock())
+    with db.deploy_conn() as conn:
+        require_migrated(conn, 'deploy')
+    store = unlock()
+    require_migrated(store._conn, 'secrets')
+    bot.run(store)
 
 
 def cmd_web(args):
     db.harden_process()
     if not db.KDF_FILE.exists():
         raise SystemExit('not initialised - run: python manage.py init')
+    if bool(args.tls_cert) != bool(args.tls_key):
+        raise SystemExit('--tls-cert and --tls-key go together')
+    with db.deploy_conn() as conn:
+        require_migrated(conn, 'deploy')
     import web
-    web.run(host=args.host, port=args.port)
+    try:
+        web.run(host=args.host, port=args.port,
+                tls=(args.tls_cert, args.tls_key) if args.tls_cert else None)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
 
 
 def cmd_user_add(args):
-    pw_hash, salt = db.hash_password(ask_passphrase(f'Password for {args.username}: ',
-                                                     confirm=True))
+    pw_hash, salt = ask_password(f'Password for {args.username}: ', confirm=True,
+                                 minimum=db.MIN_PASSWORD)
     with db.deploy_conn() as conn:
         conn.execute('INSERT INTO user (username, pw_hash, pw_salt, slack_user_id, '
                      'is_admin) VALUES (?,?,?,?,?)',
@@ -220,11 +338,15 @@ def cmd_vars_export(args):
 
 
 def cmd_project_add(args):
+    try:
+        working_dir = runner.check_working_dir(Path(args.dir).resolve())
+        remote = runner.check_remote(args.remote)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
     with db.deploy_conn() as conn:
         pid = conn.execute('INSERT INTO project (name, working_dir, branch, '
                            'git_remote) VALUES (?,?,?,?)',
-                           (args.name, str(Path(args.dir).resolve()), args.branch,
-                            args.remote)).lastrowid
+                           (args.name, working_dir, args.branch, remote)).lastrowid
     print(f'project {args.name} (id {pid})'
           + (f' <- {args.remote}' if args.remote else ''))
     if args.remote:
@@ -326,21 +448,54 @@ def _projects(name=None):
 
 
 def cmd_rekey(args):
+    db.harden_process()
     old = ask_passphrase('Current global password: ')
     new = ask_passphrase('New global password: ', confirm=True)
-    db.rekey(old, new)
+    try:
+        db.rekey(old, new)
+    finally:
+        db.wipe(old)
+        db.wipe(new)
     print('rekeyed. Restart the slack daemon and the web app.')
 
 
 def cmd_backup(args):
-    store = None if args.no_password else unlock()
+    store = unlock()
     path, pruned = scheduler.backup(store)
-    if store:
-        store.close()
+    store.close()
     print(f'wrote {path}' + (f', pruned {len(pruned)}' if pruned else ''))
 
 
+def cmd_restore(args):
+    """Replace data/ with a backup zip; the current directory is kept beside it."""
+    db.harden_process()
+    if scheduler.scheduler_alive():
+        raise SystemExit('the bot is running - stop it and the web app first')
+    if not args.yes:
+        answer = input(f'Replace {db.DATA} with {args.zip}? The current directory is '
+                       'kept beside it. [y/N] ')
+        if answer.strip().lower() != 'y':
+            raise SystemExit('aborted')
+    passphrase = ask_passphrase('Global password of the backup: ')
+    try:
+        old = scheduler.restore(args.zip, passphrase)
+    except db.Locked:
+        raise SystemExit('wrong global password, or the backup has been tampered with')
+    except (ValueError, RuntimeError) as exc:
+        raise SystemExit(str(exc))
+    finally:
+        db.wipe(passphrase)
+    print(f'restored {args.zip} into {db.DATA}')
+    if old:
+        print(f'previous state kept as {old}')
+    print('Next: make migrate, then start the bot and the web app')
+
+
 def cmd_schedule_add(args):
+    try:
+        scheduler.validate(args.at, args.weekdays)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
     target = None
     if args.project:
         with db.deploy_conn() as conn:
@@ -466,6 +621,8 @@ def main():
     w = add('web', cmd_web, help='run the web interface')
     w.add_argument('--host', default='127.0.0.1')
     w.add_argument('--port', type=int, default=8080)
+    w.add_argument('--tls-cert', help='PEM certificate; required for a non-loopback host')
+    w.add_argument('--tls-key', help='PEM private key for --tls-cert')
 
     u = add('user-add', cmd_user_add, help='add a web user')
     u.add_argument('username')
@@ -509,9 +666,10 @@ def main():
     sy.add_argument('project', nargs='?')
 
     add('rekey', cmd_rekey, help='change the global password')
-    b = add('backup', cmd_backup, help='write todays backup zip and prune old ones')
-    b.add_argument('--no-password', action='store_true',
-                   help='skip the secrets write lock (slight torn-copy risk)')
+    add('backup', cmd_backup, help='write todays sealed backup zip and prune old ones')
+    rs = add('restore', cmd_restore, help='replace data/ with a backup zip (keeps the old dir)')
+    rs.add_argument('zip')
+    rs.add_argument('--yes', action='store_true', help='skip the confirmation prompt')
     sa = add('schedule-add', cmd_schedule_add, help='add a scheduled job')
     sa.add_argument('kind', choices=['backup', 'git-pull'])
     sa.add_argument('--at', required=True, help='HH:MM')
@@ -522,6 +680,7 @@ def main():
     ic.add_argument('path', nargs='?', default='config.ini')
 
     args = p.parse_args()
+    logging.basicConfig(level=logging.INFO)
     raise SystemExit(args.fn(args) or 0)
 
 

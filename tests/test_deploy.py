@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """A real ansible run: argv construction, extravars delivery, redaction, cleanup."""
 import sys
+import tempfile
+import threading
+import time
 from datetime import date
 from pathlib import Path
 
@@ -73,8 +76,40 @@ def argv_is_built_from_structured_fields():
     assert kwargs['cmdline'] == '--tags deploy', kwargs
     assert runner.VENV_BIN in kwargs['envvars']['PATH'], \
         'ansible-runner spawns through sh, so the venv must be on PATH'
+    assert kwargs['envvars']['ANSIBLE_HOST_KEY_CHECKING'] == 'True', \
+        'a repo ansible.cfg must not be able to turn host key checking off'
     with_become = runner.runner_kwargs(CTX['project'], dict(CTX['env'], become=1))
     assert with_become['envvars']['ANSIBLE_BECOME'] == 'True'
+
+
+def git_remotes_are_https_or_ssh_only():
+    """ext:: runs a shell, file: and bare paths clone from anywhere on the box."""
+    for ok in ('https://github.com/org/repo.git', 'ssh://git@host/org/repo',
+               'git@github.com:org/repo.git', 'https://gh.example:8443/o/r', None, ''):
+        runner.check_remote(ok)
+    for bad in ('ext::sh -c id', 'file:///tmp/x', '/tmp/x', 'git://h/r',
+                'https://user:pw@h/r', 'https://h/r;id', '-oProxyCommand=id'):
+        try:
+            runner.check_remote(bad)
+            raise AssertionError(f'{bad!r} must be refused')
+        except ValueError:
+            pass
+    assert runner._git_env(None)['GIT_ALLOW_PROTOCOL'] == 'https:ssh'
+    for bad in ('relative/dir', str(runner.ROOT), str(runner.ROOT / 'src'),
+                str(db.DATA), str(db.RUN_DIR / 'x'), str(db.BACKUP_DIR)):
+        try:
+            runner.check_working_dir(bad)
+            raise AssertionError(f'{bad!r} must be refused as a checkout dir')
+        except ValueError:
+            pass
+    assert runner.check_working_dir(CTX['project']['working_dir'])
+    hostile = dict(CTX['project'], git_remote='ext::sh -c id',
+                   working_dir=str(WORK / 'nowhere'))
+    said = []
+    assert runner.git_sync(hostile, STORE, 'tester',
+                           notify=lambda msg, log=None: said.append(msg)) is None
+    assert said and 'clone URL' in said[0], said
+    assert not (WORK / 'nowhere').exists(), 'nothing may be created before the check'
 
 
 def stored_fields_cannot_become_raw_argv():
@@ -121,6 +156,100 @@ def secrets_are_redacted_from_the_log():
     assert 'ab' in out, 'values under 4 characters are too noisy to redact'
 
 
+def nested_and_escaped_values_are_redacted_too():
+    """Ansible prints mappings as JSON, so inner values and escaped spellings must match."""
+    values = [{'db': {'pw': 'in-a-mapping'}, 'hosts': ['listed-secret']},
+              'line\nbreak', 'quo"ted', 7, True]
+    text = ('{"pw": "in-a-mapping", "h": ["listed-secret"], '
+            '"m": "line\\nbreak", "q": "quo\\"ted", "n": 7, "b": true}')
+    out = runner.redact(text, values)
+    for leaked in ('in-a-mapping', 'listed-secret', 'line\\nbreak', 'quo\\"ted'):
+        assert leaked not in out, f'{leaked!r} survived: {out}'
+    assert '"n": 7' in out and 'true' in out, 'short numbers and booleans stay'
+
+
+def extravars_never_touch_argv():
+    """ansible-runner turns extravars= into -e '{json}' on the command line, which
+    every local user can read in /proc/*/cmdline. Ours must go through a file."""
+    import ansible_runner
+    workdir = tempfile.mkdtemp(dir=str(db.RUN_DIR))
+    try:
+        runner.write_extravars(workdir, {'db_password': SECRET})
+        rc = ansible_runner.RunnerConfig(private_data_dir=workdir,
+                                         **runner.runner_kwargs(CTX['project'], CTX['env']))
+        rc.prepare()
+        cmd = ' '.join(rc.command)
+        assert SECRET not in cmd, cmd
+        assert '-e @' in cmd and cmd.split('-e @', 1)[1].startswith(workdir), cmd
+        assert (Path(workdir) / 'env' / 'extravars').stat().st_mode & 0o777 == 0o600
+    finally:
+        import shutil
+        shutil.rmtree(workdir)
+
+
+def no_process_ever_carries_the_secret():
+    """Run a playbook slow enough to be caught mid-flight and scan /proc while it lives."""
+    checkout = Path(CTX['project']['working_dir'])
+    (checkout / 'slow.yml').write_text(
+        '- hosts: local\n  gather_facts: false\n  tasks:\n'
+        '    - wait_for: {timeout: 3}\n')
+    with db.deploy_conn() as conn:
+        eid = conn.execute('INSERT INTO environment (project_id, name, inventory, playbook) '
+                           "VALUES (?,'slow','hosts','slow.yml')",
+                           (CTX['project']['id'],)).lastrowid
+        env = dict(conn.execute('SELECT * FROM environment WHERE id=?', (eid,)).fetchone())
+    STORE.set('environment', eid, 'db_password', SECRET)
+    seen, leaked, done = set(), [], threading.Event()
+
+    def scan():
+        while not done.is_set():
+            for proc in Path('/proc').glob('[0-9]*'):
+                try:
+                    argv = (proc / 'cmdline').read_bytes().decode('utf-8', 'replace')
+                except OSError:
+                    continue
+                if 'ansible-playbook' in argv and str(checkout) in argv:
+                    seen.add(proc.name)
+                    if SECRET in argv:
+                        leaked.append(argv)
+            time.sleep(0.05)
+
+    watcher = threading.Thread(target=scan, daemon=True)
+    watcher.start()
+    try:
+        job_id = runner.deploy(CTX['project'], env, STORE, 'tester')
+    finally:
+        done.set()
+        watcher.join()
+    with db.deploy_conn() as conn:
+        job = dict(conn.execute('SELECT * FROM job WHERE id=?', (job_id,)).fetchone())
+    assert job['status'] == 'ok', job['log']
+    assert seen, 'the watcher never saw ansible-playbook, so the check proved nothing'
+    assert not leaked, f'secret visible in /proc cmdline: {leaked[0][:200]}'
+
+
+def a_failure_before_the_run_releases_the_claim():
+    """A store error used to leave the environment "already running" until restart."""
+    class Broken:
+        def extra_vars(self, *a):
+            raise RuntimeError('store went away')
+    job_id = runner.deploy(CTX['project'], CTX['env'], Broken(), 'tester')
+    with db.deploy_conn() as conn:
+        job = dict(conn.execute('SELECT * FROM job WHERE id=?', (job_id,)).fetchone())
+    assert job['status'] == 'error' and 'store went away' in job['log'], job
+    assert runner._claim({f"env:{CTX['eid']}"}), 'the claim must be released on failure'
+    runner._release({f"env:{CTX['eid']}"})
+
+
+def a_restart_marks_running_jobs_lost():
+    with db.deploy_conn() as conn:
+        jid = conn.execute("INSERT INTO job (kind, status) VALUES ('deploy','running')").lastrowid
+    assert runner.reap_running() == 1
+    with db.deploy_conn() as conn:
+        row = conn.execute('SELECT status, finished_at FROM job WHERE id=?', (jid,)).fetchone()
+    assert row['status'] == 'lost' and row['finished_at'], dict(row)
+
+
 def no_ssh_agent_is_left_behind():
     left = stray_agents()
     assert not left, f'{len(left)} ssh-agent(s) left holding the deploy key: {left}'
@@ -138,6 +267,9 @@ def a_second_deploy_is_refused_while_one_runs():
 if __name__ == '__main__':
     sys.exit(harness.run(
         argv_is_built_from_structured_fields, stored_fields_cannot_become_raw_argv,
+        git_remotes_are_https_or_ssh_only,
         dates_survive_json_extravars, a_real_playbook_runs,
-        secrets_are_redacted_from_the_log, no_ssh_agent_is_left_behind,
-        a_second_deploy_is_refused_while_one_runs))
+        secrets_are_redacted_from_the_log, nested_and_escaped_values_are_redacted_too,
+        extravars_never_touch_argv, no_process_ever_carries_the_secret,
+        no_ssh_agent_is_left_behind, a_second_deploy_is_refused_while_one_runs,
+        a_failure_before_the_run_releases_the_claim, a_restart_marks_running_jobs_lost))

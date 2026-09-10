@@ -50,11 +50,37 @@ def totp_uri_and_qr():
 def passwords_hash_and_verify():
     pw_hash, salt = db.hash_password('correct horse battery')
     assert len(salt) == 16 and len(pw_hash) == 32
-    assert db.check_password('correct horse battery', pw_hash, salt)
-    assert not db.check_password('correct horse batter', pw_hash, salt)
-    assert not db.check_password('', pw_hash, salt)
+    wrap = db.check_password('correct horse battery', pw_hash, salt)
+    assert wrap and len(wrap) == 32 and wrap != pw_hash, 'success yields the wrapping key'
+    assert db.check_password('correct horse batter', pw_hash, salt) is None
+    assert db.check_password('', pw_hash, salt) is None
     again, other_salt = db.hash_password('correct horse battery')
     assert other_salt != salt and again != pw_hash, 'each hash must be freshly salted'
+    import hashlib
+    legacy = hashlib.scrypt(b'correct horse battery', salt=salt,
+                            **dict(db.PW_SCRYPT, dklen=32))
+    assert legacy == pw_hash, 'hashes stored with dklen=32 must still verify'
+    for weak in ('', 'short', 'x' * (db.MIN_PASSWORD - 1)):
+        try:
+            db.check_password_strength(weak)
+            raise AssertionError(f'{weak!r} must be refused')
+        except ValueError:
+            pass
+    db.check_password_strength('x' * db.MIN_PASSWORD)
+
+
+def totp_seeds_are_sealed_under_the_password():
+    """deploy.db is plaintext; a copy of it must not be a second factor."""
+    secret = db.new_totp_secret()
+    pw_hash, salt = db.hash_password('correct horse battery')
+    wrap = db.check_password('correct horse battery', pw_hash, salt)
+    stored = db.wrap_totp(secret, wrap)
+    assert stored.startswith(db.TOTP_WRAPPED) and secret not in stored, stored
+    assert db.unwrap_totp(stored, wrap) == secret
+    assert db.unwrap_totp(stored, bytes(32)) is None, 'the wrong key yields nothing'
+    assert db.unwrap_totp(None, wrap) is None
+    assert db.unwrap_totp(secret, wrap) == secret, 'an unsealed seed passes through once'
+    assert db.wrap_totp(secret, wrap) != stored, 'a fresh nonce every time'
 
 
 def password_params_are_separate_from_the_key():
@@ -79,4 +105,5 @@ if __name__ == '__main__':
     sys.exit(harness.run(
         totp_accepts_the_current_code, totp_tolerates_clock_drift,
         totp_rejects_rubbish, totp_uri_and_qr, passwords_hash_and_verify,
+        totp_seeds_are_sealed_under_the_password,
         password_params_are_separate_from_the_key, the_first_admin_has_no_2fa_yet))

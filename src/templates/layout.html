@@ -1,7 +1,5 @@
 {% macro scope_picker(projects, environments) %}
-<label>Scope <select name="scope" onchange="
-  var g=this.value==='global';
-  this.form.scope_id.disabled=g; if(g) this.form.scope_id.value=0;">
+<label>Scope <select name="scope" data-scope-picker>
 <option value="global">global</option>
 <option value="project">project</option>
 <option value="environment">environment</option>
@@ -15,8 +13,7 @@
 <!doctype html>
 <html><head><meta charset="utf-8"><title>slack-deploy</title>
 <link rel="icon" type="image/png" href="/static/favicon.png">
-<script src="/static/jquery.min.js"></script>
-<style>
+<style nonce="{{ nonce }}">
 body{font:14px/1.5 system-ui,sans-serif;margin:0;background:#f5f6f8;color:#111}
 header{background:#1d2027;color:#fff;padding:.4rem 1rem;display:flex;gap:1rem;align-items:center}
 header img{height:34px;width:auto;display:block}
@@ -43,6 +40,9 @@ legend{font-weight:600}
 .qr svg{display:block;width:100%;height:auto}
 details summary{cursor:pointer;color:#456}
 .row{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap}
+.inline{display:inline}
+.push{margin-left:auto}
+.warn{color:#ff9b9b}
 #lock{position:fixed;inset:0;background:rgba(20,23,28,.97);color:#fff;display:none;
   align-items:center;justify-content:center;z-index:99}
 #lock div{text-align:center}
@@ -51,7 +51,7 @@ details summary{cursor:pointer;color:#456}
 <span class="brand"><img src="/static/logo.png" alt=""> slack-deploy</span>
 <a href="/">dashboard</a><a href="/secrets">variables</a><a href="/credentials">credentials</a>
 <a href="/schedules">schedules</a><a href="/users">users</a>
-<span style="margin-left:auto">{{ username }}{% if is_admin %} · admin{% endif %}</span>
+<span class="push">{{ username }}{% if is_admin %} · admin{% endif %}</span>
 <a href="/logout">log out</a>
 </header>{% endif %}
 <main>{% block body %}{% endblock %}</main>
@@ -63,25 +63,44 @@ details summary{cursor:pointer;color:#456}
 <input id="lockcode" inputmode="numeric" maxlength="6" placeholder="000000"
   autocomplete="one-time-code">
 <button id="lockgo">Unlock</button>
-<p id="lockerr" style="color:#ff9b9b"></p>
+<p id="lockerr" class="warn"></p>
 </div></div>
-<script>
-$(function () {
-  var idle = null, soft = {{ soft_seconds }} * 1000;
-  function arm() { clearTimeout(idle); idle = setTimeout(lock, soft); }
-  function lock() { $('#lock').css('display', 'flex'); $('#lockcode').focus(); }
-  $(document).on('mousemove keydown click scroll', arm);
-  $('#lockgo').on('click', function () {
-    $.post('/relock', {code: $('#lockcode').val(), ajax: 1, csrf: '{{ csrf }}'})
-      .done(function (r) {
-        if (r.ok) { $('#lock').hide(); $('#lockcode').val(''); $('#lockerr').text(''); arm(); }
-        else { $('#lockerr').text('Incorrect code'); }
-      })
-      .fail(function () { location.href = '/relock'; });
-  });
-  $('#lockcode').on('keydown', function (e) { if (e.key === 'Enter') $('#lockgo').click(); });
-  arm();
-});
-</script>
 {% endif %}
+<script nonce="{{ nonce }}">
+document.addEventListener('click', function (e) {
+  var b = e.target.closest('[data-confirm]');
+  if (b && !confirm(b.dataset.confirm)) e.preventDefault();
+});
+document.addEventListener('change', function (e) {
+  var pick = e.target.closest('[data-scope-picker]');
+  if (!pick) return;
+  var g = pick.value === 'global', target = pick.form.scope_id;
+  target.disabled = g; if (g) target.value = 0;
+});
+{% if unlocked %}
+(function () {
+  var idle = null, soft = {{ soft_seconds }} * 1000;
+  var lock = document.getElementById('lock'), code = document.getElementById('lockcode'),
+      err = document.getElementById('lockerr');
+  function arm() { clearTimeout(idle); idle = setTimeout(show, soft); }
+  function show() { lock.style.display = 'flex'; code.focus(); }
+  ['mousemove', 'keydown', 'click', 'scroll'].forEach(function (ev) {
+    document.addEventListener(ev, arm);
+  });
+  function go() {
+    var body = new URLSearchParams({code: code.value, ajax: 1, csrf: '{{ csrf }}'});
+    fetch('/relock', {method: 'POST', body: body, credentials: 'same-origin'})
+      .then(function (r) { if (!r.ok) throw r; return r.json(); })
+      .then(function (r) {
+        if (r.ok) { lock.style.display = 'none'; code.value = ''; err.textContent = ''; arm(); }
+        else { err.textContent = r.error || 'Incorrect code'; }
+      })
+      .catch(function () { location.href = '/relock'; });
+  }
+  document.getElementById('lockgo').addEventListener('click', go);
+  code.addEventListener('keydown', function (e) { if (e.key === 'Enter') go(); });
+  arm();
+})();
+{% endif %}
+</script>
 </body></html>

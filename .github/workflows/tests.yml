@@ -33,5 +33,11 @@ jobs:
           ! sqlite3 data/secrets.db .tables 2>/dev/null
           ! strings data/secrets.db | grep -qiE 'xoxb|xapp'
           venv/bin/python manage.py migrate
-          venv/bin/python manage.py backup --no-password
+          printf 'a shared passphrase long enough\n' | venv/bin/python manage.py backup
           test -f "backups/$(date +%F).zip"
+          # deploy.db travels sealed: nothing inside the zip is readable without the password
+          ! unzip -l "backups/$(date +%F).zip" | grep -q deploy.db
+          ! strings "backups/$(date +%F).zip" | grep -q 'SQLite format'
+          printf 'a shared passphrase long enough\n' \
+            | venv/bin/python manage.py restore --yes "backups/$(date +%F).zip"
+          test -f data/secrets.db

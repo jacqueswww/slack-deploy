@@ -10,7 +10,6 @@ import runner
 import scheduler
 from db import GLOBAL_SCOPE, audit, deploy_conn
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 HELP = ('Commands: `list`, `deploy <project>/<env>`, `refresh-repos [project]`')
@@ -69,7 +68,11 @@ def handle(store, client, req):
     notify = _notifier(client.web_client, req.payload)
     actor = _authorised(event.get('user'))
     # drop the leading <@bot> mention, then dispatch on the first word
-    words = [w for w in shlex.split(event.get('text', '')) if not w.startswith('<@')]
+    try:
+        words = [w for w in shlex.split(event.get('text', '')) if not w.startswith('<@')]
+    except ValueError:          # an unbalanced quote
+        notify(HELP)
+        return
     command = words[0].lower() if words else ''
     arg = words[1] if len(words) > 1 else None
 
@@ -129,6 +132,7 @@ def run(store):
     if not app_token or not bot_token:
         raise SystemExit('slack_app_token / slack_bot_token not set in the store '
                          '(manage.py secret-set global slack_bot_token)')
+    runner.reap_running()
     scheduler.start(store)
     client = SocketModeClient(app_token=app_token, web_client=WebClient(token=bot_token))
     client.socket_mode_request_listeners.append(process(store))
