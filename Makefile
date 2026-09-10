@@ -39,8 +39,9 @@ rekey: setup  ## change the global password (also upgrades KDF params)
 backup: setup  ## write today's backup zip and prune old ones
 	$(PY) manage.py backup
 
-test: setup  ## run the smoke checks
-	$(PY) tests/test_smoke.py
+test: setup  ## run every test file (T=variables to run just one)
+	@fail=0; for f in $(if $(T),tests/test_$(T).py,tests/test_*.py); do \
+	  echo "== $$f"; $(PY) $$f || fail=1; done; exit $$fail
 
 clean:  ## remove ./venv (leaves data/ alone)
 	rm -rf venv
