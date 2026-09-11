@@ -353,6 +353,40 @@ def the_export_can_be_shown_for_copy_and_paste():
     assert 'vars-export-inline' in actions, 'showing secrets must be audited'
 
 
+def a_projects_deploy_key_is_set_on_its_own_page():
+    """Finding it meant knowing to go to /credentials and pick the right scope."""
+    c = CTX['c']
+    with db.deploy_conn() as conn:
+        pid = conn.execute("SELECT id FROM project WHERE name='hosted'").fetchone()[0]
+    status, _, text, _ = c.get(f'/project?id={pid}')
+    assert status == 200 and 'Deploy key' in text
+    assert 'No key set here' in text, 'it should say so when there is none'
+
+    status, location, _, _ = c.post('/credentials', scope='project', scope_id=pid,
+                                    name='hosted-deploy', generate=1, back=pid,
+                                    csrf=CTX['csrf'])
+    assert status in (302, 303) and location.endswith(f'/project?id={pid}'), location
+    status, _, text, _ = c.get(f'/project?id={pid}')
+    assert 'hosted-deploy' in text and 'this project' in text
+    assert 'ssh-ed25519 ' in text, 'the public half belongs on the page'
+    assert 'SHA256:' in text, 'with a fingerprint to check against the host'
+    # the paste box's placeholder says "PRIVATE KEY", so compare the real bytes
+    st = next(iter(web._stores.values()))
+    private = st.cred_resolve('ssh_key', pid)['secret']
+    assert 'BEGIN OPENSSH PRIVATE KEY' in private, 'sanity: that is the private half'
+    assert private not in text, 'the private half must never reach the page'
+    for line in private.splitlines()[1:-1]:
+        assert line not in text, 'not even one line of it'
+
+    # a global key shows as inherited rather than as this project's own
+    st = next(iter(web._stores.values()))
+    st.cred_delete('project', pid, 'ssh_key')
+    st.cred_set(db.GLOBAL_SCOPE, 0, 'ssh_key', 'fallback', *db.generate_ssh_key('f'))
+    status, _, text, _ = c.get(f'/project?id={pid}')
+    assert 'inherited from global' in text and 'fallback' in text
+    assert st.cred_resolve('ssh_key', pid)['secret'] not in text
+
+
 def a_password_reset_voids_the_sealed_seed():
     c = CTX['c']
     status, _, _, _ = c.post('/users', username='bob', password='bobs-long-password',
@@ -421,6 +455,7 @@ if __name__ == '__main__':
         promotion_bites_on_the_next_request, admins_can_download_a_backup,
         bad_input_is_a_400_not_a_500, admins_maintain_a_projects_hosts,
         a_deploy_may_pick_its_tags_and_bad_ones_are_refused,
+        a_projects_deploy_key_is_set_on_its_own_page,
         the_export_can_be_shown_for_copy_and_paste,
         a_password_reset_voids_the_sealed_seed,
         relock_codes_are_throttled,

@@ -19,7 +19,7 @@ import runner
 logger = logging.getLogger(__name__)
 
 POLL_SECONDS = 60
-KINDS = ('backup', 'git-pull')
+KINDS = ('backup', 'git-pull', 'prune')
 HEARTBEAT_STALE = '-180 seconds'
 RETENTION_DAYS = 90
 
@@ -119,7 +119,13 @@ def _stamp(name):
 
 
 def prune(days=RETENTION_DAYS, today=None):
-    """Old zips, old job logs, and the debris of a backup that was killed mid-way."""
+    """Old zips, old job rows, and the debris of a backup that was killed mid-way.
+
+    A finished job is a row plus its ansible output, and the output is nearly all
+    of it - a noisy play can run to megabytes. Past the cutoff the whole row
+    goes; nothing else in the database is touched, because a project, a host or
+    a secret is worth keeping whatever its age.
+    """
     today = today or date.today()
     cutoff = today - timedelta(days=days)
     removed = []
@@ -135,7 +141,11 @@ def prune(days=RETENTION_DAYS, today=None):
         if _stamp(item.stem) != today:
             item.unlink()
     with deploy_conn() as conn:
-        conn.execute('DELETE FROM job WHERE started_at < ?', (cutoff.isoformat(),))
+        jobs = conn.execute('DELETE FROM job WHERE started_at < ?',
+                            (cutoff.isoformat(),)).rowcount
+    if removed or jobs:
+        logger.info('pruned %s backup file(s) and %s job(s) older than %s days',
+                    len(removed), jobs, days)
     return removed
 
 
@@ -246,6 +256,10 @@ def _dispatch(row, store):
     try:
         if row['kind'] == 'backup':
             backup(store)
+        elif row['kind'] == 'prune':
+            removed = prune()
+            db.audit('scheduler', 'prune',
+                     f'older than {RETENTION_DAYS} days, {len(removed)} backup(s)')
         elif row['kind'] == 'git-pull':
             projects = [p for p in db.projects()
                         if not row['target_id'] or p['id'] == row['target_id']]

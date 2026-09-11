@@ -19,11 +19,16 @@ with <code>manage.py import &lt;zip&gt;</code>.</p>
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <button>Download</button></form></fieldset>
 
+<p class="mask">A <code>prune</code> run drops job rows older than 90 days and
+backup zips past the same age. Nothing else is touched: a project, a host or a
+secret is kept whatever its age. A single job's log is capped when it is written,
+so one noisy play cannot bloat the database before the cutoff arrives.</p>
 <fieldset><legend>New schedule</legend>
 <form method="post" action="/schedules">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <label>Kind <select name="kind">
 <option value="backup">backup</option><option value="git-pull">git-pull</option>
+<option value="prune">prune</option>
 </select></label>
 <label>Project (git-pull only) <select name="target_id"><option value="">all</option>
 {% for p in projects %}<option value="{{ p.id }}">{{ p.name }}</option>{% endfor %}

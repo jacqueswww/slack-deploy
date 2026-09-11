@@ -108,6 +108,39 @@ def retention_prunes_by_date():
     assert old_job not in left and new_job in left, 'job logs follow the same retention'
 
 
+def one_noisy_play_cannot_bloat_the_database():
+    """Retention clears old rows, but a single run today can still be megabytes."""
+    import runner
+    assert runner.clamp_log(None) is None
+    assert runner.clamp_log('short') == 'short'
+    big = 'x' * (runner.MAX_LOG + 5000)
+    out = runner.clamp_log(big)
+    assert len(out) < len(big) and len(out) <= runner.MAX_LOG + 60, len(out)
+    assert out.endswith('x' * 100), 'the tail is where a failure shows'
+    assert 'bytes of earlier output dropped' in out, 'and it must say so'
+
+
+def prune_is_its_own_schedule_kind():
+    assert 'prune' in scheduler.KINDS, scheduler.KINDS
+    scheduler.validate('03:00', '*')
+    with db.deploy_conn() as conn:
+        keep = conn.execute("INSERT INTO job (kind, status) VALUES ('deploy','ok')"
+                            ).lastrowid
+        drop = conn.execute("INSERT INTO job (kind, status, started_at) VALUES "
+                            "('deploy','ok', date('now','-120 days'))").lastrowid
+        project = conn.execute(
+            "INSERT INTO project (name, working_dir) VALUES ('keeper','/tmp')").lastrowid
+    scheduler._dispatch({'kind': 'prune', 'id': 1, 'target_id': None}, STORE)
+    with db.deploy_conn() as conn:
+        left = {r[0] for r in conn.execute('SELECT id FROM job')}
+        projects = {r[0] for r in conn.execute('SELECT id FROM project')}
+        actions = [r[0] for r in conn.execute('SELECT action FROM audit')]
+    assert drop not in left, 'a job past the cutoff goes'
+    assert keep in left, 'a recent one stays'
+    assert project in projects, 'nothing but jobs and old zips is touched'
+    assert 'prune' in actions, 'and it is audited'
+
+
 def schedule_inputs_must_be_canonical():
     scheduler.validate('02:00', '*')
     scheduler.validate('23:59', '0,6')
@@ -274,7 +307,8 @@ if __name__ == '__main__':
     sys.exit(harness.run(
         backup_covers_the_whole_data_dir, run_dir_is_excluded,
         backups_live_beside_data_not_inside_it, a_backup_alone_can_be_restored,
-        retention_prunes_by_date, schedule_inputs_must_be_canonical,
+        retention_prunes_by_date, one_noisy_play_cannot_bloat_the_database,
+        prune_is_its_own_schedule_kind, schedule_inputs_must_be_canonical,
         schedule_fires_once_a_day,
         schedule_honours_weekdays, only_one_process_owns_the_scheduler,
         restore_refuses_while_the_bot_runs, restore_refuses_a_zip_that_is_not_a_backup,

@@ -30,6 +30,9 @@ token held in an encrypted store that only a human-typed passphrase can open.
   current state.
 - **Export.** A scope's variables download as YAML, or render into a readonly
   textarea on the page when you just want to copy and paste them.
+- **Retention.** A `prune` schedule drops job rows and backup zips older than 90
+  days, and one job's log is capped when written, so a noisy play cannot bloat
+  the database. Projects, hosts, secrets and users are never touched by age.
 - **Audit.** Every login, failure, unlock, reveal, export, config change and
   deploy is recorded in the database and in the process log. An export shown on
   screen is logged apart from one downloaded.
@@ -176,7 +179,7 @@ python manage.py user-add alice --slack-id U0123456 --admin
 | `project-add`, `project-list`, `sync` | Repos and checkouts |
 | `host-add <project> <name> [--address --groups --key]`, `host-list`, `host-rm` | A project's target hosts |
 | `backup`, `import <zip>`, `rekey` | Sealed backup; replace data/ with a zip (backs up first); passphrase change |
-| `schedule-add`, `schedule-list` | Daily backup or git pull at HH:MM |
+| `schedule-add`, `schedule-list` | Daily backup, git pull or prune at HH:MM |
 
 ## Tests
 

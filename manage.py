@@ -715,7 +715,7 @@ def main():
     im.add_argument('zip')
     im.add_argument('--yes', action='store_true', help='skip the confirmation prompt')
     sa = add('schedule-add', cmd_schedule_add, help='add a scheduled job')
-    sa.add_argument('kind', choices=['backup', 'git-pull'])
+    sa.add_argument('kind', choices=list(scheduler.KINDS))
     sa.add_argument('--at', required=True, help='HH:MM')
     sa.add_argument('--weekdays', default='*', help='* or 0-6 comma separated')
     sa.add_argument('--project', help='git-pull only; omit for all projects')

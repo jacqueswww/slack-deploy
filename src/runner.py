@@ -19,6 +19,10 @@ from db import BACKUP_DIR, DATA, ROOT, RUN_DIR, audit, deploy_conn, hosts as pro
 logger = logging.getLogger(__name__)
 
 LOG_TAIL = 2000
+# What one job may keep in the database. Retention clears old rows, but a single
+# noisy play can run to megabytes today, so the tail is kept and the middle
+# dropped: a failure shows up at the end, not in the thousandth ok= line.
+MAX_LOG = 256 * 1024
 _running = set()
 _running_lock = threading.Lock()
 _live = set()      # secret files and dirs to remove however the process ends
@@ -240,7 +244,16 @@ def _start_job(kind, project_id, environment_id, actor):
         return cur.lastrowid
 
 
+def clamp_log(text):
+    """The tail, with a line saying what was dropped."""
+    if not text or len(text) <= MAX_LOG:
+        return text
+    dropped = len(text) - MAX_LOG
+    return f'[{dropped} bytes of earlier output dropped]\n' + text[-MAX_LOG:]
+
+
 def _finish_job(job_id, status, exit_code, log):
+    log = clamp_log(log)
     with deploy_conn() as conn:
         conn.execute("UPDATE job SET status=?, exit_code=?, finished_at=datetime('now'), "
                      'log=? WHERE id=?', (status, exit_code, log, job_id))

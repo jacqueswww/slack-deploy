@@ -146,6 +146,20 @@ def _scope(scope, scope_id):
         raise cherrypy.HTTPError(400, 'scope_id must be a number')
 
 
+def _deploy_key(project_id):
+    """The ssh key this project would actually deploy with, and where it comes
+    from. Never the private half: cred_resolve selects the row whole."""
+    cred = store().cred_resolve('ssh_key', int(project_id))
+    if not cred:
+        return None
+    own = cred['scope'] == 'project' and cred['scope_id'] == int(project_id)
+    public = cred['public'] or ''
+    return {'name': cred['name'], 'public': public, 'own': own,
+            'scope': cred['scope'], 'updated_at': cred['updated_at'],
+            'updated_by': cred['updated_by'],
+            'fingerprint': db.fingerprint(public) if public.count(' ') >= 1 else None}
+
+
 def require_admin():
     if not cherrypy.session.get('is_admin'):
         raise cherrypy.HTTPError(403, 'admin only')
@@ -397,7 +411,8 @@ class Root:
         if cherrypy.request.method != 'POST':
             return render('project.html',
                           project=_row('SELECT * FROM project WHERE id=?', (id,))
-                          if id else None, hosts=db.hosts(id) if id else [])
+                          if id else None, hosts=db.hosts(id) if id else [],
+                          deploy_key=_deploy_key(id) if id else None)
         require_admin()
         if not delete:
             try:
@@ -511,7 +526,9 @@ class Root:
 
     @cherrypy.expose
     def credentials(self, scope='global', scope_id=0, kind='ssh_key', name=None,
-                    secret=None, generate=None, delete=None, csrf=None):
+                    secret=None, generate=None, delete=None, back=None, csrf=None):
+        """back= returns to that project's page, for the deploy key shown there.
+        It is an id, not a URL, so it can only ever point back into this app."""
         scope, scope_id = _scope(scope, scope_id)
         st = store()
         if cherrypy.request.method == 'POST':
@@ -527,6 +544,8 @@ class Root:
             else:
                 st.cred_set(scope, scope_id, kind, name, secret, None, actor())
                 audit(actor(), 'cred-set', f'{scope}/{scope_id}/{kind}')
+            if back:
+                raise cherrypy.HTTPRedirect(f'/project?id={int(back)}')
             raise cherrypy.HTTPRedirect('/credentials')
         return render('credentials.html', creds=st.cred_list(),
                       projects=db.projects(),

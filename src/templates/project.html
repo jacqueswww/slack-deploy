@@ -18,6 +18,59 @@ daemon user's own key. Leave blank if you check the repo out by hand.</span></p>
 </fieldset></form>
 
 {% if project %}
+<h2>Deploy key</h2>
+<p class="mask">The ssh key ansible uses for this project. A key set here beats
+the global one; with none set, the global one is used. The private half never
+leaves the encrypted store, and is written to a 0600 file only for the length of
+a run. Put the public half in each host's <code>authorized_keys</code>.</p>
+{% if deploy_key %}
+<table><tr><th>Name</th><th>From</th><th>Fingerprint</th><th>Updated</th></tr>
+<tr><td>{{ deploy_key.name }}</td>
+<td>{% if deploy_key.own %}this project{% else %}<span class="mask">inherited from {{ deploy_key.scope }}</span>{% endif %}</td>
+<td><code class="pick">{{ deploy_key.fingerprint or '-' }}</code></td>
+<td>{{ deploy_key.updated_at }}<br><span class="mask">{{ deploy_key.updated_by or '' }}</span></td></tr></table>
+{% if deploy_key.public %}<p><b>Public half</b><br>
+<textarea rows="2" cols="76" readonly class="pick">{{ deploy_key.public }}</textarea></p>{% endif %}
+{% else %}
+<p><span class="mask">No key set here and none global. Ansible will fall back to
+the daemon user's own ssh key.</span></p>
+{% endif %}
+
+{% if is_admin %}
+<fieldset><legend>Set this project's key</legend>
+<form method="post" action="/credentials" class="row">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="scope" value="project">
+<input type="hidden" name="scope_id" value="{{ project.id }}">
+<input type="hidden" name="back" value="{{ project.id }}">
+<label>Name <input name="name" value="{{ project.name }}-deploy" required></label>
+<button name="generate" value="1"
+  data-confirm="Generate a new key for this project? It replaces any key set here, and the old private half is gone."
+  >Generate a new key</button>
+</form>
+<form method="post" action="/credentials">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="scope" value="project">
+<input type="hidden" name="scope_id" value="{{ project.id }}">
+<input type="hidden" name="kind" value="ssh_key">
+<input type="hidden" name="back" value="{{ project.id }}">
+<p class="row"><label>Name <input name="name" value="{{ project.name }}-deploy" required></label></p>
+<p><textarea name="secret" rows="5" cols="76" required
+  placeholder="-----BEGIN OPENSSH PRIVATE KEY----- ... paste an existing private key"></textarea></p>
+<button data-confirm="Save this key? It replaces any key set on this project."
+  >Save a pasted key</button></form>
+{% if deploy_key and deploy_key.own %}
+<form method="post" action="/credentials">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="scope" value="project">
+<input type="hidden" name="scope_id" value="{{ project.id }}">
+<input type="hidden" name="kind" value="ssh_key">
+<input type="hidden" name="back" value="{{ project.id }}">
+<button name="delete" value="1"
+  data-confirm="Remove this project's key? Deploys fall back to the global one, and the private half is gone."
+  >Remove this project's key</button></form>{% endif %}
+</fieldset>{% endif %}
+
 <h2>Hosts</h2>
 <p class="mask">Written out as the inventory at deploy time: a line per host, a
 <code>[group]</code> section per group. A pinned key goes into a known_hosts file
