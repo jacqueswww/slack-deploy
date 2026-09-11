@@ -4,6 +4,5 @@
 # agree about which store they are talking about.
 set -e
 : "${HOISTY_DATA:=/var/lib/hoisty/data}"
-: "${HOISTY_RUNTIME:=/run/hoisty}"
-export HOISTY_DATA HOISTY_RUNTIME
+export HOISTY_DATA
 exec /var/lib/hoisty/venv/bin/python /var/lib/hoisty/app/manage.py "$@"

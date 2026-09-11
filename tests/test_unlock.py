@@ -20,7 +20,7 @@ def a_fresh_daemon_is_locked():
     CTX['path'] = db.DATA.parent / 'run' / 'unlock.sock'
     # the tests are not root, so they allow their own uid; production takes the
     # default, which the next check pins to root and nothing else
-    CTX['srv'] = unlock.serve(gate, CTX['path'], allow_uids=(os.getuid(),))
+    unlock.serve(gate, CTX['path'], allow_uids=(os.getuid(),))
     assert gate.store is None and not gate.ready.is_set()
     assert unlock.ask('status', path=CTX['path']) == 'locked'
     assert CTX['path'].stat().st_mode & 0o777 == 0o600, oct(CTX['path'].stat().st_mode)

@@ -112,7 +112,7 @@ def process(store):
     return listener
 
 
-def run(allow_uids=unlock.ROOT_ONLY):
+def run():
     """Start locked and inert, then serve once someone unlocks.
 
     There is nothing to do before that: the Slack tokens are themselves in the
@@ -121,7 +121,7 @@ def run(allow_uids=unlock.ROOT_ONLY):
     here until an administrator runs `hoisty unlock`."""
     runner.reap_running()
     gate = unlock.Gate()
-    unlock.serve(gate, allow_uids=allow_uids)
+    unlock.serve(gate)
     unlock.sd_notify('READY=1\nSTATUS=locked - waiting for: hoisty unlock')
     logger.info('locked - waiting for: hoisty unlock (%s)', unlock.SOCKET)
     gate.ready.wait()

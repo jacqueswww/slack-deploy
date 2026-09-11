@@ -24,8 +24,7 @@ import db
 
 logger = logging.getLogger(__name__)
 
-RUNTIME = Path(os.environ.get('HOISTY_RUNTIME') or '/run/hoisty')
-SOCKET = RUNTIME / 'unlock.sock'
+SOCKET = Path(os.environ.get('HOISTY_RUNTIME') or '/run/hoisty') / 'unlock.sock'
 MAX_LINE = 4096
 ROOT_ONLY = (0,)
 
@@ -138,7 +137,6 @@ def serve(gate, path=None, allow_uids=ROOT_ONLY):
                 _serve_one(conn, gate, allow_uids)
 
     threading.Thread(target=loop, daemon=True, name='unlock').start()
-    return srv
 
 
 # --- client ---------------------------------------------------------------

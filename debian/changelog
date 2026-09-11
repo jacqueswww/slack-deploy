@@ -8,4 +8,4 @@ hoisty (0.1.0) noble; urgency=medium
   * Vendored virtualenv, every wheel checked against the sha256 recorded in
     requirements.txt.
 
- -- hoisty maintainers <maintainer@example.invalid>  Thu, 11 Sep 2026 09:00:00 +0200
+ -- Jacques Wagener <jacques+noreply@dilectum.co.za>  Thu, 11 Sep 2026 09:00:00 +0200

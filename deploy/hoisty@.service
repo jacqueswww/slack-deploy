@@ -38,7 +38,6 @@ User=hoisty
 Group=hoisty
 WorkingDirectory=/var/lib/hoisty
 Environment=HOISTY_DATA=/var/lib/hoisty/data
-Environment=HOISTY_RUNTIME=/run/hoisty
 Environment=HOME=/var/lib/hoisty
 Environment=ANSIBLE_LOCAL_TEMP=/tmp/ansible
 Environment=ANSIBLE_SSH_CONTROL_PATH_DIR=/tmp/ansible/cp

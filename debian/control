@@ -1,7 +1,7 @@
 Source: hoisty
 Section: admin
 Priority: optional
-Maintainer: hoisty maintainers <maintainer@example.invalid>
+Maintainer: Jacques Wagener <jacques+noreply@dilectum.co.za>
 Build-Depends: debhelper-compat (= 13),
                python3 (>= 3.12),
                python3-venv,
