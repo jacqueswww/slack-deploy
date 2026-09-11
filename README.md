@@ -28,8 +28,11 @@ token held in an encrypted store that only a human-typed passphrase can open.
 - **Backups.** Daily sealed zip of the whole data directory, 90-day retention.
   `import <zip>` brings one back from any path, after taking a full backup of the
   current state.
+- **Export.** A scope's variables download as YAML, or render into a readonly
+  textarea on the page when you just want to copy and paste them.
 - **Audit.** Every login, failure, unlock, reveal, export, config change and
-  deploy is recorded in the database and in the process log.
+  deploy is recorded in the database and in the process log. An export shown on
+  screen is logged apart from one downloaded.
 
 ## Security in brief
 
