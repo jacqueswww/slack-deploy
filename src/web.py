@@ -136,11 +136,6 @@ def _write(sql, args=()):
         return conn.execute(sql, args).lastrowid
 
 
-def _environments():
-    return _rows('SELECT e.*, p.name AS project_name FROM environment e '
-                 'JOIN project p ON p.id=e.project_id ORDER BY p.name, e.name')
-
-
 def _scope(scope, scope_id):
     """Validated (scope, int scope_id) from request params."""
     if scope not in db.SCOPES:
@@ -293,7 +288,7 @@ class Root:
     def _totp_setup_page(self, secret, user, error):
         uri = db.totp_uri(secret, user['username'])
         return render('auth.html', stage='totp_setup', expired=None, error=error,
-                      secret=secret, uri=uri, qr=db.totp_qr_svg(uri))
+                      secret=secret, uri=uri)
 
     @cherrypy.expose
     def totp(self, code=None, csrf=None):
@@ -377,8 +372,8 @@ class Root:
     @cherrypy.expose
     def index(self):
         return render('index.html',
-                      projects=_rows('SELECT * FROM project ORDER BY name'),
-                      environments=_environments(),
+                      projects=db.projects(),
+                      environments=db.environments(),
                       jobs=_rows('SELECT j.*, p.name AS project_name, e.name AS env_name '
                                  'FROM job j LEFT JOIN project p ON p.id=j.project_id '
                                  'LEFT JOIN environment e ON e.id=j.environment_id '
@@ -391,7 +386,7 @@ class Root:
         if cherrypy.request.method != 'POST':
             return render('project.html',
                           project=_row('SELECT * FROM project WHERE id=?', (id,))
-                          if id else None)
+                          if id else None, hosts=db.hosts(id) if id else [])
         require_admin()
         if not delete:
             try:
@@ -414,6 +409,27 @@ class Root:
             audit(actor(), 'project-create', f'id={new_id}')
         raise cherrypy.HTTPRedirect('/')
 
+    # --- hosts ------------------------------------------------------------
+    @cherrypy.expose
+    def host(self, project_id=None, name=None, address=None, groups=None,
+             ssh_host_key=None, delete=None, csrf=None):
+        if cherrypy.request.method != 'POST':
+            raise cherrypy.HTTPError(405)
+        require_admin()
+        project = _row('SELECT id FROM project WHERE id=?', (project_id,))
+        if delete:
+            if not db.host_delete(project['id'], name):
+                raise cherrypy.HTTPError(404, f'no such host: {name}')
+            audit(actor(), 'host-delete', f"project={project['id']} name={name}")
+        else:
+            try:
+                name, key = db.host_set(project['id'], name, address, groups, ssh_host_key)
+            except ValueError as exc:
+                raise cherrypy.HTTPError(400, str(exc))
+            audit(actor(), 'host-set', f"project={project['id']} name={name} "
+                                       f"pinned={bool(key)}")
+        raise cherrypy.HTTPRedirect(f"/project?id={project['id']}")
+
     # --- environments -----------------------------------------------------
     @cherrypy.expose
     def environment(self, id=None, project_id=None, name=None, inventory=None,
@@ -423,7 +439,7 @@ class Root:
             return render('environment.html',
                           env=_row('SELECT * FROM environment WHERE id=?', (id,))
                           if id else None,
-                          projects=_rows('SELECT * FROM project ORDER BY name'))
+                          projects=db.projects())
         require_admin()
         if delete:
             _write('DELETE FROM environment WHERE id=?', (id,))
@@ -434,7 +450,7 @@ class Root:
                              ('tags', tags), ('limit_hosts', limit_hosts)):
             if value and value.startswith('-'):
                 raise cherrypy.HTTPError(400, f'{field} may not start with "-"')
-        args = (project_id, name, inventory, playbook, tags or None,
+        args = (project_id, name, inventory or None, playbook, tags or None,
                 limit_hosts or None, 1 if become else 0)
         if id:
             _write('UPDATE environment SET project_id=?, name=?, inventory=?, '
@@ -456,7 +472,8 @@ class Root:
                        'JOIN project p ON p.id=e.project_id WHERE e.id=?',
                        (environment_id,))
         project = _row('SELECT * FROM project WHERE id=?', (env_row['project_id'],))
-        runner.spawn(_deploy_and_close, project, env_row, store().clone(), actor())
+        st, who = store().clone(), actor()
+        runner.spawn(_then_close, st, lambda: runner.deploy(project, env_row, st, who))
         raise cherrypy.HTTPRedirect('/')
 
     @cherrypy.expose
@@ -464,7 +481,8 @@ class Root:
         if cherrypy.request.method != 'POST':
             raise cherrypy.HTTPError(405)
         project = _row('SELECT * FROM project WHERE id=?', (project_id,))
-        runner.spawn(_sync_and_close, project, store().clone(), actor())
+        st, who = store().clone(), actor()
+        runner.spawn(_then_close, st, lambda: runner.git_sync(project, st, who))
         raise cherrypy.HTTPRedirect('/')
 
     @cherrypy.expose
@@ -487,8 +505,8 @@ class Root:
                 audit(actor(), 'cred-set', f'{scope}/{scope_id}/{kind}')
             raise cherrypy.HTTPRedirect('/credentials')
         return render('credentials.html', creds=st.cred_list(),
-                      projects=_rows('SELECT * FROM project ORDER BY name'),
-                      environments=_environments())
+                      projects=db.projects(),
+                      environments=db.environments())
 
     @cherrypy.expose
     def job(self, id):
@@ -529,8 +547,8 @@ class Root:
                       secrets=st.names(scope, scope_id),
                       revealed=name if shown else None, shown=shown, error=error,
                       var_types=db.VAR_TYPES,
-                      projects=_rows('SELECT * FROM project ORDER BY name'),
-                      environments=_environments())
+                      projects=db.projects(),
+                      environments=db.environments())
 
     @cherrypy.expose
     def vars_import(self, scope=None, scope_id=None, varsfile=None, csrf=None):
@@ -622,7 +640,7 @@ class Root:
         if cherrypy.request.method != 'POST':
             return render('schedules.html',
                           schedules=_rows('SELECT * FROM schedule ORDER BY at_time'),
-                          projects=_rows('SELECT * FROM project ORDER BY name'))
+                          projects=db.projects())
         require_admin()
         if not delete:
             if kind not in scheduler.KINDS:
@@ -646,16 +664,10 @@ class Root:
         raise cherrypy.HTTPRedirect('/schedules')
 
 
-def _sync_and_close(project, st, who):
+def _then_close(st, fn):
+    """Worker thread body: the session's store clone is closed however fn ends."""
     try:
-        runner.git_sync(project, st, who)
-    finally:
-        st.close()
-
-
-def _deploy_and_close(project, env_row, st, who):
-    try:
-        runner.deploy(project, env_row, st, who)
+        fn()
     finally:
         st.close()
 

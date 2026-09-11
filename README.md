@@ -22,8 +22,9 @@ token held in an encrypted store that only a human-typed passphrase can open.
   fails the deploy instead of being accepted.
 - **Git sync.** Clone or fast-forward each project's repo on demand or on a
   schedule, over HTTPS with a stored PAT or over SSH.
-- **Backups.** Daily sealed zip of the whole data directory, 90-day retention,
-  one-command restore.
+- **Backups.** Daily sealed zip of the whole data directory, 90-day retention.
+  `import <zip>` brings one back from any path, after taking a full backup of the
+  current state.
 - **Audit.** Every login, failure, unlock, reveal, export, config change and
   deploy is recorded in the database and in the process log.
 
@@ -140,7 +141,7 @@ python manage.py user-add alice --slack-id U0123456 --admin
 | `cred-set`, `cred-gen`, `cred-list`, `cred-rm` | SSH keys and GitHub PATs |
 | `project-add`, `project-list`, `sync` | Repos and checkouts |
 | `host-add <project> <name> [--address --groups --key]`, `host-list`, `host-rm` | A project's target hosts |
-| `backup`, `restore <zip>`, `rekey` | Sealed backups, passphrase change |
+| `backup`, `import <zip>`, `rekey` | Sealed backup; replace data/ with a zip (backs up first); passphrase change |
 | `schedule-add`, `schedule-list` | Daily backup or git pull at HH:MM |
 
 ## Tests

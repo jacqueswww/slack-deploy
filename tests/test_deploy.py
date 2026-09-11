@@ -19,8 +19,8 @@ SECRET = 'super-secret-value'
 
 
 def stray_agents():
-    """ansible-runner's ssh_key= wraps the run in an ssh-agent that outlives it,
-    leaving the decrypted key resident in memory. We must never leave one."""
+    """An ssh-agent started for a run outlives it holding the decrypted key.
+    We must never leave one."""
     found = []
     for proc in Path('/proc').glob('[0-9]*'):
         try:
@@ -69,17 +69,17 @@ def _setup():
 
 def argv_is_built_from_structured_fields():
     _setup()
-    kwargs = runner.runner_kwargs(CTX['project'], CTX['env'])
+    argv = runner.playbook_argv(CTX['project'], CTX['env'], '/run/vars.json', '/run/k')
     checkout = Path(CTX['project']['working_dir'])
-    assert kwargs['playbook'] == str(checkout / 'site.yml'), kwargs
-    assert kwargs['inventory'] == str(checkout / 'hosts'), kwargs
-    assert kwargs['cmdline'] == '--tags deploy', kwargs
-    assert runner.VENV_BIN in kwargs['envvars']['PATH'], \
-        'ansible-runner spawns through sh, so the venv must be on PATH'
-    assert kwargs['envvars']['ANSIBLE_HOST_KEY_CHECKING'] == 'True', \
+    assert argv == [runner.ANSIBLE_PLAYBOOK, str(checkout / 'site.yml'),
+                    '-i', str(checkout / 'hosts'), '--tags', 'deploy',
+                    '-e', '@/run/vars.json', '--private-key', '/run/k'], argv
+    env = runner._ansible_env(CTX['env'])
+    assert env['PATH'].startswith(runner.VENV_BIN), 'ansible-connection is found on PATH'
+    assert env['ANSIBLE_HOST_KEY_CHECKING'] == 'True', \
         'a repo ansible.cfg must not be able to turn host key checking off'
-    with_become = runner.runner_kwargs(CTX['project'], dict(CTX['env'], become=1))
-    assert with_become['envvars']['ANSIBLE_BECOME'] == 'True'
+    assert 'ANSIBLE_BECOME' not in env
+    assert runner._ansible_env(dict(CTX['env'], become=1))['ANSIBLE_BECOME'] == 'True'
 
 
 def git_remotes_are_https_or_ssh_only():
@@ -120,14 +120,14 @@ def stored_fields_cannot_become_raw_argv():
             ('tags', '$(whoami)', 'command substitution'),
             ('playbook', '../../../etc/passwd', 'path traversal')):
         try:
-            runner.runner_kwargs(CTX['project'], dict(CTX['env'], **{field: value}))
+            runner.playbook_argv(CTX['project'], dict(CTX['env'], **{field: value}))
             raise AssertionError(f'{field}={value!r} must be rejected ({why})')
         except ValueError:
             pass
 
 
 def dates_survive_json_extravars():
-    """ansible-runner ships extravars as JSON, which has no date type."""
+    """Extra-vars travel as JSON, which has no date type."""
     out = runner.json_safe({'d': date(2026, 1, 1), 'nested': {'l': [date(2027, 2, 3)]},
                             'plain': 'x', 'n': 7})
     assert out == {'d': '2026-01-01', 'nested': {'l': ['2027-02-03']},
@@ -169,19 +169,15 @@ def nested_and_escaped_values_are_redacted_too():
 
 
 def extravars_never_touch_argv():
-    """ansible-runner turns extravars= into -e '{json}' on the command line, which
-    every local user can read in /proc/*/cmdline. Ours must go through a file."""
-    import ansible_runner
+    """-e '{json}' on the command line is readable by every local user in
+    /proc/*/cmdline. Ours must go through a 0600 file."""
     workdir = tempfile.mkdtemp(dir=str(db.RUN_DIR))
     try:
-        runner.write_extravars(workdir, {'db_password': SECRET})
-        rc = ansible_runner.RunnerConfig(private_data_dir=workdir,
-                                         **runner.runner_kwargs(CTX['project'], CTX['env']))
-        rc.prepare()
-        cmd = ' '.join(rc.command)
-        assert SECRET not in cmd, cmd
-        assert '-e @' in cmd and cmd.split('-e @', 1)[1].startswith(workdir), cmd
-        assert (Path(workdir) / 'env' / 'extravars').stat().st_mode & 0o777 == 0o600
+        path = runner.write_extravars(workdir, {'db_password': SECRET})
+        argv = runner.playbook_argv(CTX['project'], CTX['env'], path)
+        assert SECRET not in ' '.join(argv), argv
+        assert '@' + path in argv and path.startswith(workdir), argv
+        assert Path(path).stat().st_mode & 0o777 == 0o600
     finally:
         import shutil
         shutil.rmtree(workdir)
@@ -228,6 +224,143 @@ def no_process_ever_carries_the_secret():
     assert not leaked, f'secret visible in /proc cmdline: {leaked[0][:200]}'
 
 
+def project_hosts_become_the_inventory():
+    """Hosts on the project are written out as an inventory and, where a key is
+    pinned, a known_hosts file; an environment with no inventory file uses them alone."""
+    checkout = Path(CTX['project']['working_dir'])
+    (checkout / 'managed.yml').write_text(
+        '- hosts: local\n  connection: local\n  gather_facts: false\n  tasks:\n'
+        '    - assert:\n        that: db_password == "%s"\n' % SECRET)
+    with db.deploy_conn() as conn:
+        pid = conn.execute("INSERT INTO project (name, working_dir, branch) "
+                           "VALUES ('managed',?,'main')", (str(checkout),)).lastrowid
+        eid = conn.execute('INSERT INTO environment (project_id, name, inventory, playbook) '
+                           "VALUES (?,'live',NULL,'managed.yml')", (pid,)).lastrowid
+        project = dict(conn.execute('SELECT * FROM project WHERE id=?', (pid,)).fetchone())
+        env = dict(conn.execute('SELECT * FROM environment WHERE id=?', (eid,)).fetchone())
+    try:
+        runner.playbook_argv(project, env)
+        raise AssertionError('no inventory file and no hosts must be refused')
+    except ValueError:
+        pass
+    _, public = db.generate_ssh_key('host')
+    pinned = public.rsplit(' ', 1)[0]
+    db.host_set(pid, 'box', '127.0.0.1', 'local')
+    db.host_set(pid, 'db1.example', None, 'db, web', pinned + ' a comment')
+    for bad in (('a b',), ('ok', 'x\n[evil]'), ('ok', None, 'g;h'), ('ok', None, None, 'rubbish'),
+                ('ok', None, None, 'ssh-ed25519 !!!'), ('ok', None, None, 'ssh-dss AAAA')):
+        try:
+            db.check_host(*bad)
+            raise AssertionError(f'{bad!r} must be refused')
+        except ValueError:
+            pass
+    rows = db.hosts(pid)
+    assert [h['name'] for h in rows] == ['box', 'db1.example'], rows
+    assert rows[1]['groups'] == 'db,web' and rows[1]['ssh_host_key'] == pinned
+    assert rows[1]['fingerprint'].startswith('SHA256:') and rows[0]['fingerprint'] is None
+    workdir = tempfile.mkdtemp(dir=str(db.RUN_DIR))
+    try:
+        inv = Path(runner.write_inventory(workdir, rows)).read_text()
+        assert inv == ('box ansible_host=127.0.0.1\ndb1.example\n'
+                       '[db]\ndb1.example\n[local]\nbox\n[web]\ndb1.example\n'), inv
+        known = runner.write_known_hosts(workdir, rows)
+        assert Path(known).read_text() == f'db1.example {pinned}\n'
+        extra = runner._ansible_env(env, known)['ANSIBLE_SSH_EXTRA_ARGS']
+        assert known in extra and 'UserKnownHostsFile' in extra, extra
+        assert runner.write_known_hosts(workdir, rows[:1]) is None, 'nothing pinned, no file'
+        argv = runner.playbook_argv(project, env, inventory_path=known)
+        assert '-i' in argv and argv.count('-i') == 1, argv
+    finally:
+        import shutil
+        shutil.rmtree(workdir)
+    STORE.set('environment', eid, 'db_password', SECRET)
+    job_id = runner.deploy(project, env, STORE, 'tester')
+    with db.deploy_conn() as conn:
+        job = dict(conn.execute('SELECT * FROM job WHERE id=?', (job_id,)).fetchone())
+    assert job['status'] == 'ok' and 'ok=1' in job['log'], job['log']
+    with db.deploy_conn() as conn:
+        conn.execute('DELETE FROM project WHERE id=?', (pid,))
+        assert conn.execute('SELECT count(*) FROM host WHERE project_id=?',
+                            (pid,)).fetchone()[0] == 0, 'hosts go with their project'
+
+
+def a_host_update_never_silently_unpins_the_key():
+    """The web form's key box is always empty, so an edit that omits the key must
+    keep the pin: losing it downgrades the host to the unpinned fallback."""
+    pid = CTX['project']['id']
+    _, public = db.generate_ssh_key('host')
+    pinned = public.rsplit(' ', 1)[0]
+    db.host_set(pid, 'keeper', '10.0.0.9', 'web', pinned)
+    name, key = db.host_set(pid, 'keeper', '10.0.0.10', 'web')      # address only
+    assert key == pinned, 'omitting the key must not unpin the host'
+    row = [h for h in db.hosts(pid) if h['name'] == 'keeper'][0]
+    assert row['ssh_host_key'] == pinned and row['address'] == '10.0.0.10', row
+    db.host_delete(pid, 'keeper')
+
+
+def host_fields_cannot_reach_ssh_as_options_or_extra_lines():
+    """Both become the ssh destination and a known_hosts line, so a leading dash
+    is an option and a trailing newline is a second line. `$` matches before a
+    trailing newline, which is why every pattern here uses fullmatch."""
+    for bad in ('web1\n', '-E', '-oProxyCommand'):
+        try:
+            db.check_host(bad)
+            raise AssertionError(f'name {bad!r} must be refused')
+        except ValueError:
+            pass
+    try:
+        db.check_host('h', '-E')
+        raise AssertionError('an address may not start with "-"')
+    except ValueError:
+        pass
+    try:
+        db.check_host('h', None, 'web\n')
+        raise AssertionError('a group may not carry a newline')
+    except ValueError:
+        pass
+    assert runner.SAFE_REMOTE.fullmatch('https://h/r\n') is None
+    assert runner.SAFE_TAGS.fullmatch('deploy\n') is None
+    try:
+        runner.check_remote('https://github.com/o/r\n')
+        raise AssertionError('a remote may not carry a newline')
+    except ValueError:
+        pass
+
+
+def host_key_checking_does_not_depend_on_pinning_state():
+    """Set only when something was pinned, a repo's own ssh_extra_args became
+    authoritative exactly when no key was pinned."""
+    for known in (None, '/run/known_hosts'):
+        extra = runner._ansible_env(CTX['env'], known)['ANSIBLE_SSH_EXTRA_ARGS']
+        assert 'StrictHostKeyChecking=yes' in extra, extra
+        assert '~/.ssh/known_hosts' in extra, extra
+        assert (known or 'nothing') in extra or known is None, extra
+
+
+def a_timed_out_run_kills_the_whole_tree():
+    """ansible forks a worker per host; killing only the parent leaves them
+    touching production after the key file has been deleted under them."""
+    def sleepers():
+        """Only real sleep processes: a shell quoting this file would match a grep."""
+        out = []
+        for proc in Path('/proc').glob('[0-9]*'):
+            try:
+                argv = (proc / 'cmdline').read_bytes().decode('utf-8', 'replace')
+            except OSError:
+                continue
+            if argv.startswith('sleep\x004077'):
+                out.append(proc.name)
+        return out
+
+    # the background sleep holds the stdout pipe, so a parent that exits first
+    # used to leave communicate() blocked on forks nothing was going to kill
+    for script in ('sleep 4077 & sleep 4077', 'sleep 4077 & exit 0'):
+        code, out = runner._run(['sh', '-c', script], '/tmp', timeout=2)
+        assert code == 124 and 'killed after 2s' in out, (script, code, out)
+        time.sleep(0.2)
+        assert not sleepers(), f'orphans survived the timeout ({script}): {sleepers()}'
+
+
 def a_failure_before_the_run_releases_the_claim():
     """A store error used to leave the environment "already running" until restart."""
     class Broken:
@@ -272,4 +405,8 @@ if __name__ == '__main__':
         secrets_are_redacted_from_the_log, nested_and_escaped_values_are_redacted_too,
         extravars_never_touch_argv, no_process_ever_carries_the_secret,
         no_ssh_agent_is_left_behind, a_second_deploy_is_refused_while_one_runs,
+        project_hosts_become_the_inventory, a_host_update_never_silently_unpins_the_key,
+        host_fields_cannot_reach_ssh_as_options_or_extra_lines,
+        host_key_checking_does_not_depend_on_pinning_state,
+        a_timed_out_run_kills_the_whole_tree,
         a_failure_before_the_run_releases_the_claim, a_restart_marks_running_jobs_lost))

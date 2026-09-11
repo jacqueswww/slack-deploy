@@ -6,6 +6,7 @@ from slack_sdk import WebClient
 from slack_sdk.socket_mode import SocketModeClient
 from slack_sdk.socket_mode.response import SocketModeResponse
 
+import db
 import runner
 import scheduler
 from db import GLOBAL_SCOPE, audit, deploy_conn
@@ -34,14 +35,6 @@ def _authorised(slack_user_id):
     return row['username'] if row else None
 
 
-def _environments():
-    with deploy_conn() as conn:
-        return [dict(r) for r in conn.execute(
-            'SELECT e.*, p.name AS project_name, p.working_dir, p.branch, '
-            'p.id AS pid FROM environment e JOIN project p ON p.id = e.project_id '
-            'ORDER BY p.name, e.name')]
-
-
 def _resolve(token, envs):
     """Accept `project/env`, or a bare env name when it is unique."""
     if '/' in token:
@@ -50,15 +43,6 @@ def _resolve(token, envs):
     else:
         matches = [e for e in envs if e['name'] == token]
     return matches[0] if len(matches) == 1 else None
-
-
-def _projects(name=None):
-    with deploy_conn() as conn:
-        sql, args = 'SELECT * FROM project', ()
-        if name:
-            sql += ' WHERE name=?'
-            args = (name,)
-        return [dict(r) for r in conn.execute(sql, args)]
 
 
 def handle(store, client, req):
@@ -87,7 +71,7 @@ def handle(store, client, req):
         audit(event.get('user'), 'slack-denied', command)
         return
 
-    envs = _environments()
+    envs = db.environments()
     if command == 'list':
         if not envs:
             notify('No environments configured')
@@ -102,11 +86,11 @@ def handle(store, client, req):
         if not env:
             notify(f'Environment not found or ambiguous: {arg}')
             return
-        project = _projects(env['project_name'])[0]
+        project = db.projects(env['project_name'])[0]
         notify(f"Starting deployment for {env['project_name']}/{env['name']}")
         runner.spawn(runner.deploy, project, env, store, actor, notify)
     elif command == 'refresh-repos':
-        projects = _projects(arg)
+        projects = db.projects(arg)
         if not projects:
             notify(f'No such project: {arg}' if arg else 'No projects configured')
             return

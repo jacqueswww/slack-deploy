@@ -4,7 +4,7 @@ HOST  ?= 127.0.0.1
 PORT  ?= 8080
 STAMP := venv/.installed
 
-.PHONY: help setup init doctor bot web test backup migrate rekey sync cred-gen cred-list clean lock
+.PHONY: help setup init doctor bot web test backup migrate rekey clean lock
 
 help:
 	@grep -hE '^[a-z-]+:.*##' $(MAKEFILE_LIST) | sed 's/:.*##/\t/' | expand -t18
@@ -51,12 +51,3 @@ lock:  ## regenerate requirements.txt (pins + sha256 of every wheel) from requir
 	.lock-venv/bin/pip-compile --quiet --generate-hashes --allow-unsafe --strip-extras \
 	  --output-file requirements.txt requirements.in
 	rm -rf .lock-venv
-
-sync: setup  ## clone or fast-forward every project checkout
-	$(PY) manage.py sync
-
-cred-gen: setup  ## generate an ssh key: make cred-gen NAME=deploy-key
-	$(PY) manage.py cred-gen $(NAME)
-
-cred-list: setup  ## list stored credentials
-	$(PY) manage.py cred-list

@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """slack-deploy admin CLI. Run from the checkout: python manage.py <command>."""
 import argparse
-import configparser
 import getpass
 import logging
 import os
-import shlex
 import stat
 import sys
 import termios
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -150,20 +149,20 @@ def cmd_doctor(args):
     problems = []
     uid = os.getuid()
 
-    def check(path, want_mode, label):
+    def check(path, label):
         if not path.exists():
             problems.append(f'missing: {path}')
             return
         st = path.stat()
         if st.st_uid != uid:
             problems.append(f'{label} not owned by uid {uid}: {path}')
-        if st.st_mode & 0o077 & ~want_mode:
+        if st.st_mode & 0o077:
             problems.append(f'{label} readable by others ({oct(stat.S_IMODE(st.st_mode))}): {path}')
 
-    check(db.DATA, 0, 'data dir')
-    check(db.BACKUP_DIR, 0, 'backup dir')
+    check(db.DATA, 'data dir')
+    check(db.BACKUP_DIR, 'backup dir')
     for f in (db.DEPLOY_DB, db.SECRETS_DB, db.KDF_FILE):
-        check(f, 0, 'file')
+        check(f, 'file')
     if ROOT.stat().st_mode & 0o022:
         problems.append(f'checkout is group/other writable: {ROOT}')
     # a playbook runs as this uid; if this uid can rewrite the code or the venv, one
@@ -177,15 +176,13 @@ def cmd_doctor(args):
     if not Path(runner.GIT).exists():
         problems.append(f'git not found at {runner.GIT}')
     if db.DEPLOY_DB.exists():
-        with db.deploy_conn() as conn:
-            for row in conn.execute('SELECT name, working_dir FROM project'):
-                wd = Path(row['working_dir'])
-                if not wd.exists():
-                    problems.append(f"project {row['name']}: missing {wd}")
-                elif wd.stat().st_mode & 0o022:
-                    problems.append(f"project {row['name']}: checkout writable by "
-                                    f'others, anyone who can edit it receives that '
-                                    f"project's secrets: {wd}")
+        for row in db.projects():
+            wd = Path(row['working_dir'])
+            if not wd.exists():
+                problems.append(f"project {row['name']}: missing {wd}")
+            elif wd.stat().st_mode & 0o022:
+                problems.append(f"project {row['name']}: checkout writable by others, "
+                                f"anyone who can edit it receives that project's secrets: {wd}")
     problems += host_posture()
     print(f'running as uid {uid} ({getpass.getuser()}), data dir {db.DATA}')
     print('NOTE: encryption only protects a stolen database file unless this uid is '
@@ -350,11 +347,45 @@ def cmd_project_add(args):
     print(f'project {args.name} (id {pid})'
           + (f' <- {args.remote}' if args.remote else ''))
     if args.remote:
-        print(f'Next: make sync    # or: python manage.py sync {args.name}')
+        print(f'Next: python manage.py sync {args.name}')
+
+
+def _project(name):
+    rows = db.projects(name)
+    if not rows:
+        raise SystemExit(f'no such project: {name}')
+    return rows[0]
+
+
+def cmd_host_add(args):
+    project = _project(args.project)
+    try:
+        name, key = db.host_set(project['id'], args.name, args.address, args.groups, args.key)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+    db.audit(getpass.getuser(), 'host-set', f"project={project['id']} name={name} "
+                                            f'pinned={bool(key)}')
+    print(f"{args.project}/{name}" + (f' pinned {db.fingerprint(key)}' if key
+                                       else ' (no host key pinned)'))
+
+
+def cmd_host_list(args):
+    for project in ([_project(args.project)] if args.project else db.projects()):
+        for h in db.hosts(project['id']):
+            print(f"{project['name']:16} {h['name']:24} {h['address'] or '-':20} "
+                  f"{h['groups'] or '-':16} {h['fingerprint'] or 'not pinned'}")
+
+
+def cmd_host_rm(args):
+    project = _project(args.project)
+    if not db.host_delete(project['id'], args.name):
+        raise SystemExit(f'no such host: {args.project}/{args.name}')
+    db.audit(getpass.getuser(), 'host-delete', f"project={project['id']} name={args.name}")
+    print(f'removed {args.project}/{args.name}')
 
 
 def cmd_project_list(args):
-    for p in _projects():
+    for p in db.projects():
         print(f"{p['name']:20} {p['branch']:10} {p['working_dir']}")
         if p['git_remote']:
             print(f"{'':20} remote: {p['git_remote']}")
@@ -422,7 +453,7 @@ def cmd_cred_rm(args):
 def cmd_sync(args):
     """Clone the project's ansible repo, or fast-forward it if already there."""
     store = unlock()
-    projects = _projects(args.project)
+    projects = db.projects(args.project)
     if not projects:
         raise SystemExit(f'no such project: {args.project}' if args.project
                          else 'no projects configured')
@@ -436,15 +467,6 @@ def cmd_sync(args):
             if row['status'] != 'ok':
                 print(row['log'], file=sys.stderr)
     store.close()
-
-
-def _projects(name=None):
-    with db.deploy_conn() as conn:
-        sql, params = 'SELECT * FROM project', ()
-        if name:
-            sql += ' WHERE name=?'
-            params = (name,)
-        return [dict(r) for r in conn.execute(sql, params)]
 
 
 def cmd_rekey(args):
@@ -466,28 +488,66 @@ def cmd_backup(args):
     print(f'wrote {path}' + (f', pruned {len(pruned)}' if pruned else ''))
 
 
-def cmd_restore(args):
-    """Replace data/ with a backup zip; the current directory is kept beside it."""
+def safety_backup(passphrase):
+    """Back up the current data dir before it is replaced. Never fatal: restore
+    keeps the old directory beside the new one anyway, and the states this command
+    exists to recover from - a half-finished rekey, a deleted secrets.db, a machine
+    whose own password nobody remembers - are exactly the ones that cannot be
+    backed up. Blocking on them would leave the operator with no way forward."""
+    if not db.KDF_FILE.exists():
+        print('no store here yet, nothing to back up first')
+        return
+    store = None
+    try:
+        store = db.SecretStore.unlock(passphrase)
+        path, _ = scheduler.backup(store, day=f'{datetime.now():%Y-%m-%d-%H%M%S}-pre-import')
+        print(f'backed up the current state to {path}')
+    except Exception as exc:
+        why = ('that is not this machine\'s global password' if isinstance(exc, db.Locked)
+               else exc)
+        print(f'WARNING: could not back up the current state ({why}). The current '
+              'directory is still kept beside the new one.', file=sys.stderr)
+    finally:
+        if store:
+            store.close()
+
+
+def cmd_import(args):
+    """Replace data/ with a backup zip from anywhere. A full sealed backup of the
+    current state is written to backups/ first, and the old directory is kept."""
     db.harden_process()
+    zip_path = Path(args.zip).resolve()
+    if not zip_path.is_file():
+        raise SystemExit(f'no such file: {zip_path}')
     if scheduler.scheduler_alive():
         raise SystemExit('the bot is running - stop it and the web app first')
     if not args.yes:
-        answer = input(f'Replace {db.DATA} with {args.zip}? The current directory is '
-                       'kept beside it. [y/N] ')
+        answer = input(f'Replace {db.DATA} with {zip_path}? The current state is backed '
+                       'up first. [y/N] ')
         if answer.strip().lower() != 'y':
             raise SystemExit('aborted')
-    passphrase = ask_passphrase('Global password of the backup: ')
+    passphrase = ask_passphrase()
+    other = None
     try:
-        old = scheduler.restore(args.zip, passphrase)
-    except db.Locked:
-        raise SystemExit('wrong global password, or the backup has been tampered with')
+        safety_backup(passphrase)
+        try:
+            old = scheduler.restore(zip_path, passphrase)
+        except db.Locked:
+            # the zip predates a rekey, or came from another install
+            other = ask_passphrase('That is not the password of this backup. Its global password: ')
+            try:
+                old = scheduler.restore(zip_path, other)
+            except db.Locked:
+                raise SystemExit('wrong global password, or the backup has been tampered with')
     except (ValueError, RuntimeError) as exc:
         raise SystemExit(str(exc))
     finally:
         db.wipe(passphrase)
-    print(f'restored {args.zip} into {db.DATA}')
+        if other is not None:
+            db.wipe(other)
+    print(f'imported {zip_path} into {db.DATA}')
     if old:
-        print(f'previous state kept as {old}')
+        print(f'previous directory kept as {old}')
     print('Next: make migrate, then start the bot and the web app')
 
 
@@ -517,83 +577,6 @@ def cmd_schedule_list(args):
             print(f"{r['id']:3} {r['kind']:10} at {r['at_time']} days={r['weekdays']:8} "
                   f"target={r['target_id'] or 'all':5} "
                   f"{'on' if r['enabled'] else 'off':4} last={r['last_run_on'] or '-'}")
-
-
-def cmd_import_config(args):
-    """Move an old config.ini into the project layout."""
-    store = unlock()
-    cfg = configparser.ConfigParser()
-    if not cfg.read(args.path):
-        raise SystemExit(f'cannot read {args.path}')
-    glob = dict(cfg['global_settings']) if cfg.has_section('global_settings') else {}
-    for key in ('slack_app_token', 'slack_bot_token'):
-        if glob.get(key):
-            store.set(db.GLOBAL_SCOPE, 0, key, glob[key], actor=getpass.getuser())
-            print(f'stored {key} in the encrypted store')
-    for slack_id in filter(None, (s.strip() for s in
-                                  glob.get('user_whitelist', '').split(','))):
-        with db.deploy_conn() as conn:
-            conn.execute('UPDATE user SET slack_user_id=? WHERE slack_user_id IS NULL '
-                         'AND id=(SELECT min(id) FROM user WHERE slack_user_id IS NULL)',
-                         (slack_id,))
-        print(f'whitelisted slack id {slack_id} (check with: manage.py user-list)')
-
-    projects, skipped = {}, []
-    for section in cfg.sections():
-        if not section.startswith('env:'):
-            continue
-        env_name = section.split('env:', 1)[1]
-        info = dict(cfg[section])
-        working_dir = info['working_dir']
-        if working_dir not in projects:
-            name = Path(working_dir).name
-            with db.deploy_conn() as conn:
-                row = conn.execute('SELECT id FROM project WHERE name=?',
-                                   (name,)).fetchone()
-                projects[working_dir] = row['id'] if row else conn.execute(
-                    'INSERT INTO project (name, working_dir, branch) VALUES (?,?,?)',
-                    (name, working_dir, info.get('branch', 'master'))).lastrowid
-            print(f'project {name} -> {working_dir}')
-        parsed = parse_playbook_params(info.get('playbook_params', ''))
-        if parsed is None:
-            skipped.append((env_name, info.get('playbook_params')))
-            continue
-        with db.deploy_conn() as conn:
-            conn.execute('INSERT OR REPLACE INTO environment (project_id, name, '
-                         'inventory, playbook, tags, limit_hosts, become) '
-                         'VALUES (?,?,?,?,?,?,?)',
-                         (projects[working_dir], env_name, parsed['inventory'],
-                          parsed['playbook'], parsed['tags'], parsed['limit_hosts'],
-                          parsed['become']))
-        print(f'  environment {env_name}: {parsed}')
-    store.close()
-    for name, raw in skipped:
-        print(f'SKIPPED {name}: could not map "{raw}" - add it by hand', file=sys.stderr)
-    return 1 if skipped else 0
-
-
-def parse_playbook_params(raw):
-    """Map an old params string onto structured columns, or None if unrecognised."""
-    out = {'inventory': None, 'playbook': None, 'tags': None, 'limit_hosts': None,
-           'become': 0}
-    tokens = shlex.split(raw)
-    i = 0
-    while i < len(tokens):
-        token = tokens[i]
-        if token in ('-i', '--inventory', '--inventory-file'):
-            out['inventory'] = tokens[i + 1]; i += 2
-        elif token in ('--tags', '-t'):
-            out['tags'] = tokens[i + 1]; i += 2
-        elif token in ('--limit', '-l'):
-            out['limit_hosts'] = tokens[i + 1]; i += 2
-        elif token in ('-b', '--become'):
-            out['become'] = 1; i += 1
-        elif not token.startswith('-') and out['playbook'] is None:
-            out['playbook'] = token; i += 1
-        else:
-            return None  # anything else is arbitrary argv, refuse to guess
-        continue
-    return out if out['inventory'] and out['playbook'] else None
 
 
 # --- argparse -------------------------------------------------------------
@@ -649,6 +632,17 @@ def main():
     pa.add_argument('--remote', help='https or ssh clone url')
     pa.add_argument('--branch', default='master')
     add('project-list', cmd_project_list, help='list projects')
+    ha = add('host-add', cmd_host_add, help="add or update one of a project's hosts")
+    ha.add_argument('project')
+    ha.add_argument('name', help='inventory name')
+    ha.add_argument('--address', help='ansible_host, when it differs from the name')
+    ha.add_argument('--groups', help='comma separated inventory groups')
+    ha.add_argument('--key', help='"<type> <base64>" from ssh-keyscan; pins the host key')
+    hl = add('host-list', cmd_host_list, help='list hosts')
+    hl.add_argument('project', nargs='?')
+    hr = add('host-rm', cmd_host_rm, help='remove a host')
+    hr.add_argument('project')
+    hr.add_argument('name')
 
     cs = scoped(add('cred-set', cmd_cred_set,
                     help='store an ssh key or github pat'))
@@ -667,17 +661,16 @@ def main():
 
     add('rekey', cmd_rekey, help='change the global password')
     add('backup', cmd_backup, help='write todays sealed backup zip and prune old ones')
-    rs = add('restore', cmd_restore, help='replace data/ with a backup zip (keeps the old dir)')
-    rs.add_argument('zip')
-    rs.add_argument('--yes', action='store_true', help='skip the confirmation prompt')
+    im = add('import', cmd_import,
+             help='replace data/ with a backup zip, after a full backup of the current state')
+    im.add_argument('zip')
+    im.add_argument('--yes', action='store_true', help='skip the confirmation prompt')
     sa = add('schedule-add', cmd_schedule_add, help='add a scheduled job')
     sa.add_argument('kind', choices=['backup', 'git-pull'])
     sa.add_argument('--at', required=True, help='HH:MM')
     sa.add_argument('--weekdays', default='*', help='* or 0-6 comma separated')
     sa.add_argument('--project', help='git-pull only; omit for all projects')
     add('schedule-list', cmd_schedule_list, help='list schedules')
-    ic = add('import-config', cmd_import_config, help='migrate an old config.ini')
-    ic.add_argument('path', nargs='?', default='config.ini')
 
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO)

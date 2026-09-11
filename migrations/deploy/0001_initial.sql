@@ -3,17 +3,35 @@ CREATE TABLE IF NOT EXISTS project (
   name TEXT NOT NULL UNIQUE,
   working_dir TEXT NOT NULL,
   branch TEXT NOT NULL DEFAULT 'master',
+  -- clone URL; https remotes authenticate with the github_pat credential,
+  -- ssh remotes with the daemon user's own key
+  git_remote TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS environment (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
-  inventory TEXT NOT NULL,
+  -- inventory file in the checkout; NULL means the project's host table alone
+  inventory TEXT,
   playbook TEXT NOT NULL,
   tags TEXT,
   limit_hosts TEXT,
   become INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(project_id, name)
+);
+-- Target hosts a project deploys to. Written out as an inventory at run time
+-- (name, ansible_host=address, one [group] section per group) and, where a host
+-- key is pinned, as a known_hosts file, so a first connection is never trust on
+-- first use and a changed key fails the run.
+CREATE TABLE IF NOT EXISTS host (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  address TEXT,
+  groups TEXT,
+  ssh_host_key TEXT,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(project_id, name)
 );
 CREATE TABLE IF NOT EXISTS user (
@@ -22,6 +40,7 @@ CREATE TABLE IF NOT EXISTS user (
   pw_hash BLOB NOT NULL,
   pw_salt BLOB NOT NULL,
   slack_user_id TEXT,
+  -- sealed under the user's password (db.wrap_totp), never a bare seed
   totp_secret TEXT,
   totp_confirmed INTEGER NOT NULL DEFAULT 0,
   is_admin INTEGER NOT NULL DEFAULT 0,

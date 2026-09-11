@@ -16,10 +16,6 @@ ansible-core==2.13.13 \
     --hash=sha256:7ad2d8c0a5fa4a59de1809a5f96d2dbf511189c834116f5c72aec9730b51074b \
     --hash=sha256:f50220254b8e13a79b68e68e759f5bf89f3f3584c907737985a017c699b1c3b6
     # via ansible
-ansible-runner==2.3.6 \
-    --hash=sha256:4f153d9c3000a61b82d7253ca292849e3ad2c5d68dfff4377a6b98c4e6ff6c3e \
-    --hash=sha256:b2174a12dcad2dc2f342ea82876898f568a0b66c53568600bf80577158fcba1c
-    # via -r requirements.in
 cffi==2.1.1 \
     --hash=sha256:046bfc24911b37851ee1b51aab8bffe713d89c68c6a057b09484ce9fd5f69b4e \
     --hash=sha256:06c72bb76605a4b0cd0aad6930b69d4baf7dd5d806cfc409b824191099700e66 \
@@ -209,10 +205,6 @@ jinja2==3.1.6 \
     # via
     #   -r requirements.in
     #   ansible-core
-lockfile==0.12.2 \
-    --hash=sha256:6aed02de03cba24efabcd600b30540140634fc06cfa603822d508d5361e9f799 \
-    --hash=sha256:6c3cb24f344923d30b2785d5ad75182c8ea7ac1b6171b08657258ec7429d50fa
-    # via python-daemon
 markdown-it-py==4.2.0 \
     --hash=sha256:04a21681d6fbb623de53f6f364d352309d4094dd4194040a10fd51833e418d49 \
     --hash=sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a
@@ -323,21 +315,11 @@ more-itertools==11.1.0 \
 packaging==26.3 \
     --hash=sha256:94edc256424af38762eb31306eed28beb9f0efc50a8837492c9d6fd6004aed79 \
     --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
-    # via
-    #   ansible-core
-    #   ansible-runner
-pexpect==4.9.0 \
-    --hash=sha256:7236d1e080e4936be2dc3e326cec0af72acf9212a7e1d060210e70a47e253523 \
-    --hash=sha256:ee7d41123f3c9911050ea2c2dac107568dc43b2d3b0c7557a33212c398ead30f
-    # via ansible-runner
+    # via ansible-core
 portend==3.2.1 \
     --hash=sha256:aa9d40ab1f9e14bdb7d401f42210df35d017c9b97991baeb18568cedfb8c6489 \
     --hash=sha256:bd2bb1cd8585e32f1f986c1b8eae2950c8622c648db163b711a2fc2ef8d8d492
     # via cherrypy
-ptyprocess==0.7.0 \
-    --hash=sha256:4b41f3967fce3af57cc7e94b888626c18bf37a083e3651ca8feeb66d492fef35 \
-    --hash=sha256:5c5d0a3b48ceee0b48485e0c26037c0acd7d29765ca3fbb5cb3831d347423220
-    # via pexpect
 pycparser==3.0 \
     --hash=sha256:600f49d217304a5902ac3c37e1281c9fe94e4d0489de643a9504c5cdfdfc6b29 \
     --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
@@ -346,10 +328,6 @@ pygments==2.21.0 \
     --hash=sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9 \
     --hash=sha256:610ca751c9bc2492b38eb9a38a7fbc93edbbb2d7182edaf34e66ae493dee5c8c
     # via rich
-python-daemon==3.1.2 \
-    --hash=sha256:b906833cef63502994ad48e2eab213259ed9bb18d54fa8774dcba2ff7864cec6 \
-    --hash=sha256:f7b04335adc473de877f5117e26d5f1142f4c9f7cd765408f0877757be5afbf4
-    # via ansible-runner
 python-dateutil==2.9.0.post0 \
     --hash=sha256:37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3 \
     --hash=sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427
@@ -411,11 +389,6 @@ pyyaml==6.0.2 \
     # via
     #   -r requirements.in
     #   ansible-core
-    #   ansible-runner
-qrcode==8.0 \
-    --hash=sha256:025ce2b150f7fe4296d116ee9bad455a6643ab4f6e7dce541613a4758cbce347 \
-    --hash=sha256:9fc05f03305ad27a709eb742cf3097fa19e6f6f93bb9e2f039c0979190f6f1b1
-    # via -r requirements.in
 resolvelib==0.8.1 \
     --hash=sha256:c6ea56732e9fb6fca1b2acc2ccc68a0b6b8c566d8f3e78e0443310ede61dbd37 \
     --hash=sha256:d9b7907f055c3b3a2cfc56c914ffd940122915826ff5fb5b1de0c99778f4de98
@@ -431,9 +404,7 @@ shellingham==1.5.4 \
 six==1.17.0 \
     --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274 \
     --hash=sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81
-    # via
-    #   ansible-runner
-    #   python-dateutil
+    # via python-dateutil
 slack-sdk==3.19.4 \
     --hash=sha256:67b05e636fee6e2cb2ed140fc79cb1cd370a7a983ec6e60fdebaf83e48a53383 \
     --hash=sha256:71e222f5a55d2f704638602f0883def9d331539462edc6d9cb88f83044fbce70

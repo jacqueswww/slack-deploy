@@ -35,16 +35,12 @@ def totp_rejects_rubbish():
     assert not db.totp_verify('', '123456', now)
 
 
-def totp_uri_and_qr():
+def totp_uri():
     secret = db.new_totp_secret()
     uri = db.totp_uri(secret, 'jacques@example')
     assert uri.startswith('otpauth://totp/slack-deploy:'), uri
     assert f'secret={secret}' in uri and 'digits=6' in uri and 'period=30' in uri
     assert '@' not in uri.split('?')[0].split(':')[-1], 'the label must be url encoded'
-    svg = db.totp_qr_svg(uri)
-    assert svg.startswith('<svg') and svg.endswith('</svg>'), svg[:60]
-    assert '<?xml' not in svg, 'the declaration must be stripped so it can be inlined'
-    assert secret not in svg, 'the secret is encoded in the paths, not written out'
 
 
 def passwords_hash_and_verify():
@@ -104,6 +100,6 @@ def the_first_admin_has_no_2fa_yet():
 if __name__ == '__main__':
     sys.exit(harness.run(
         totp_accepts_the_current_code, totp_tolerates_clock_drift,
-        totp_rejects_rubbish, totp_uri_and_qr, passwords_hash_and_verify,
+        totp_rejects_rubbish, totp_uri, passwords_hash_and_verify,
         totp_seeds_are_sealed_under_the_password,
         password_params_are_separate_from_the_key, the_first_admin_has_no_2fa_yet))

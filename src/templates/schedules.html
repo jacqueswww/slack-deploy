@@ -13,7 +13,7 @@
 {% if is_admin %}<fieldset><legend>Download a backup</legend>
 <p>Writes and downloads a fresh zip. Everything in it is sealed under the global password:
 without it the file is noise, and a tampered file refuses to restore. Restore on any machine
-with <code>manage.py restore &lt;zip&gt;</code>.</p>
+with <code>manage.py import &lt;zip&gt;</code>.</p>
 <form method="post" action="/backup">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <button>Download</button></form></fieldset>

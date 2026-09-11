@@ -8,7 +8,8 @@
   {% if env and env.project_id == p.id %}selected{% endif %}>{{ p.name }}</option>
 {% endfor %}</select></label></p>
 <p><label>Name <input name="name" value="{{ env.name if env else '' }}" required></label></p>
-<p><label>Inventory <input name="inventory" value="{{ env.inventory if env else '' }}" required></label></p>
+<p><label>Inventory <input name="inventory" value="{{ env.inventory or '' if env else '' }}"
+   placeholder="blank: the project's hosts only"></label></p>
 <p><label>Playbook <input name="playbook" value="{{ env.playbook if env else '' }}" required></label></p>
 <p><label>Tags <input name="tags" value="{{ env.tags or '' if env else '' }}"></label></p>
 <p><label>Limit <input name="limit_hosts" value="{{ env.limit_hosts or '' if env else '' }}"></label></p>

@@ -1,5 +1,6 @@
 """Two-database store: plaintext deploy.db, SQLCipher-encrypted secrets.db."""
 import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -135,8 +136,7 @@ _derive_lock = threading.Lock()
 
 def wipe(buf):
     """Zero a bytearray in place; the one thing Python lets us scrub."""
-    for i in range(len(buf)):
-        buf[i] = 0
+    buf[:] = bytes(len(buf))
 
 
 def _libc():
@@ -177,13 +177,6 @@ def _kdf_key(cfg, passphrase):
     return derive_key(passphrase, bytes.fromhex(cfg['salt']), params or KEY_SCRYPT)
 
 
-def read_kdf():
-    """Salt and the params the store was actually built with, not today's."""
-    cfg = json.loads(KDF_FILE.read_text())
-    params = {k: cfg[k] for k in KDF_KEYS if k in cfg}
-    return bytes.fromhex(cfg['salt']), (params or KEY_SCRYPT)
-
-
 def write_kdf(salt, params=None, previous=None):
     """previous= keeps the old salt alongside while a rekey is mid-flight."""
     cfg = {'salt': salt.hex(), **(params or KEY_SCRYPT)}
@@ -191,11 +184,6 @@ def write_kdf(salt, params=None, previous=None):
         cfg['previous'] = {k: previous[k] for k in ('salt', *KDF_KEYS) if k in previous}
     KDF_FILE.write_text(json.dumps(cfg))
     KDF_FILE.chmod(0o600)
-
-
-def key_from_passphrase(passphrase):
-    salt, params = read_kdf()
-    return derive_key(passphrase, salt, params)
 
 
 def open_store(passphrase):
@@ -382,9 +370,6 @@ class SecretStore:
     def begin_immediate(self):
         """Write lock, so a byte copy of secrets.db is consistent."""
         return _WriteLock(self)
-
-    def backup_key(self):
-        return backup_key(self._key)
 
     def orphan_sweep(self):
         """Drop secrets whose owning row is gone: there is no foreign key across files."""
@@ -618,24 +603,105 @@ def totp_verify(secret, code, now=None):
                for drift in range(-TOTP_SKEW, TOTP_SKEW + 1))
 
 
-def totp_qr_svg(uri):
-    """Inline SVG, so the secret never travels in a URL or lands in an access log."""
-    import io
-    import qrcode
-    import qrcode.image.svg
-    code = qrcode.QRCode(box_size=10, border=2,
-                         error_correction=qrcode.constants.ERROR_CORRECT_M)
-    code.add_data(uri)
-    buf = io.BytesIO()
-    code.make_image(image_factory=qrcode.image.svg.SvgPathImage).save(buf)
-    # drop the xml declaration so it can be embedded straight into the page
-    return buf.getvalue().decode().split('?>', 1)[-1].strip()
-
-
 def totp_uri(secret, username, issuer='slack-deploy'):
     from urllib.parse import quote
     return (f'otpauth://totp/{quote(issuer)}:{quote(username)}?secret={secret}'
             f'&issuer={quote(issuer)}&digits={TOTP_DIGITS}&period={TOTP_STEP}')
+
+
+# --- deploy.db reads shared by bot, web, scheduler and the CLI ----------------
+
+def projects(name=None):
+    with deploy_conn() as conn:
+        sql, args = 'SELECT * FROM project', ()
+        if name:
+            sql, args = sql + ' WHERE name=?', (name,)
+        return [dict(r) for r in conn.execute(sql + ' ORDER BY name', args)]
+
+
+def environments():
+    with deploy_conn() as conn:
+        return [dict(r) for r in conn.execute(
+            'SELECT e.*, p.name AS project_name FROM environment e '
+            'JOIN project p ON p.id=e.project_id ORDER BY p.name, e.name')]
+
+
+# --- hosts: a project's targets, written out as inventory and known_hosts -----
+
+# fullmatch, never match: `$` also matches before a trailing newline, and a name
+# ending in one would split the generated inventory or known_hosts line in two.
+HOST_NAME = re.compile(r'[A-Za-z0-9._-]+')
+HOST_ADDRESS = re.compile(r'[A-Za-z0-9._:-]+')            # hostname, IPv4 or IPv6
+HOST_GROUP = re.compile(r'[A-Za-z0-9_]+')
+HOST_KEY_TYPES = ('ssh-ed25519', 'ssh-rsa', 'ecdsa-sha2-nistp256',
+                  'ecdsa-sha2-nistp384', 'ecdsa-sha2-nistp521')
+
+
+def check_host(name, address=None, groups=None, ssh_host_key=None):
+    """(name, address, groups, key), each a strict token: every one becomes part
+    of a generated inventory or known_hosts line."""
+    if not HOST_NAME.fullmatch(name or ''):
+        raise ValueError('host name may only contain letters, digits, . _ -')
+    address = (address or '').strip() or None
+    if address and not HOST_ADDRESS.fullmatch(address):
+        raise ValueError('address must be a hostname or IP')
+    # both reach ssh as the destination argument, where a leading dash is an option
+    for field, value in (('name', name), ('address', address)):
+        if value and value.startswith('-'):
+            raise ValueError(f'host {field} may not start with "-": {value}')
+    names = [g for g in (groups or '').replace(' ', '').split(',') if g]
+    if any(not HOST_GROUP.fullmatch(g) for g in names):
+        raise ValueError('groups: comma-separated names of letters, digits, _')
+    key = ' '.join((ssh_host_key or '').split()[:2]) or None     # drop any comment
+    if key:
+        kind, _, blob = key.partition(' ')
+        try:
+            valid = kind in HOST_KEY_TYPES and bool(base64.b64decode(blob, validate=True))
+        except (binascii.Error, ValueError):
+            valid = False
+        if not valid:
+            raise ValueError('ssh host key must be "<type> <base64>" as ssh-keyscan prints it')
+    return name, address, ','.join(names) or None, key
+
+
+def fingerprint(ssh_host_key):
+    """SHA256:... as ssh-keygen -lf prints it, for checking against the console."""
+    blob = base64.b64decode(ssh_host_key.split()[1])
+    return 'SHA256:' + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip('=')
+
+
+def hosts(project_id):
+    with deploy_conn() as conn:
+        rows = [dict(r) for r in conn.execute(
+            'SELECT * FROM host WHERE project_id=? ORDER BY name', (project_id,))]
+    for row in rows:
+        row['fingerprint'] = fingerprint(row['ssh_host_key']) if row['ssh_host_key'] else None
+    return rows
+
+
+def host_set(project_id, name, address=None, groups=None, ssh_host_key=None):
+    """A key of None keeps whatever is pinned: the web form's key box is always
+    empty, so overwriting would silently unpin the host on any other edit. Remove
+    a pin by deleting the host and adding it again."""
+    name, address, groups, key = check_host(name, address, groups, ssh_host_key)
+    with deploy_conn() as conn:
+        conn.execute(
+            'INSERT INTO host (project_id, name, address, groups, ssh_host_key) '
+            'VALUES (?,?,?,?,?) ON CONFLICT(project_id, name) DO UPDATE SET '
+            'address=excluded.address, groups=excluded.groups, '
+            'ssh_host_key=coalesce(excluded.ssh_host_key, host.ssh_host_key), '
+            "updated_at=datetime('now')",
+            (project_id, name, address, groups, key))
+        if key is None:
+            key = conn.execute('SELECT ssh_host_key FROM host WHERE project_id=? AND '
+                               'name=?', (project_id, name)).fetchone()[0]
+    return name, key
+
+
+def host_delete(project_id, name):
+    with deploy_conn() as conn:
+        return conn.execute('DELETE FROM host WHERE project_id=? AND name=?',
+                            (project_id, name)).rowcount
 
 
 # --- audit ----------------------------------------------------------------
@@ -675,11 +741,12 @@ def init(passphrase):
     for d in (DATA, RUN_DIR, BACKUP_DIR):
         d.mkdir(parents=True, exist_ok=True)
         d.chmod(0o700)
-    write_kdf(os.urandom(16))
+    salt = os.urandom(16)
+    write_kdf(salt)
     with deploy_conn() as conn:
         migrate(conn, 'deploy')
     DEPLOY_DB.chmod(0o600)
-    key = key_from_passphrase(passphrase)
+    key = derive_key(passphrase, salt)
     conn = _open_secrets(key, create=True)
     migrate(conn, 'secrets')
     conn.close()

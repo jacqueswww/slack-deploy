@@ -13,13 +13,10 @@
 
 {% elif stage == 'totp_setup' %}
 <h2>Register 2FA</h2>
-<p>Scan this with your authenticator, then enter a code to confirm. Required
-once per account.</p>
-<div class="qr">{{ qr | safe }}</div>
-<details><summary>Can't scan it?</summary>
+<p>Add this secret to your authenticator (manual entry, time based, 6 digits),
+then enter a code to confirm. Required once per account.</p>
 <p><b>Secret</b><br><code class="pick">{{ secret }}</code></p>
 <p><b>Setup URI</b><br><code class="pick">{{ uri }}</code></p>
-</details>
 <form method="post" action="/totp_setup">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <p><input name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6"

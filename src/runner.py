@@ -1,10 +1,10 @@
 """Single job runner shared by the Slack daemon, the web UI and the scheduler."""
 import atexit
+import contextlib
 import json
 import logging
 import os
 import re
-import shlex
 import shutil
 import signal
 import subprocess
@@ -14,32 +14,31 @@ import threading
 from datetime import date, datetime
 from pathlib import Path
 
-import ansible_runner
-
-from db import BACKUP_DIR, DATA, ROOT, RUN_DIR, audit, deploy_conn
+from db import BACKUP_DIR, DATA, ROOT, RUN_DIR, audit, deploy_conn, hosts as project_hosts
 
 logger = logging.getLogger(__name__)
 
 LOG_TAIL = 2000
 _running = set()
 _running_lock = threading.Lock()
-_live_files = set()
-_live_dirs = set()
+_live = set()      # secret files and dirs to remove however the process ends
 
 VENV_BIN = str(Path(sys.executable).parent)   # do not resolve(): venv/bin/python is a symlink
 ANSIBLE_PLAYBOOK = str(Path(VENV_BIN) / 'ansible-playbook')
 GIT = '/usr/bin/git'
-SAFE_TAGS = re.compile(r'^[A-Za-z0-9_,.:-]+$')
+DEPLOY_TIMEOUT = 6 * 3600
+# fullmatch everywhere: `$` also matches before a trailing newline
+SAFE_TAGS = re.compile(r'[A-Za-z0-9_,.:-]+')
 # https, ssh:// or scp-style only: no file paths, no ext::/fd:: helpers, no
 # cleartext git://. GIT_ALLOW_PROTOCOL in _git_env is the second lock on that door.
-SAFE_REMOTE = re.compile(r'^(https://[A-Za-z0-9._-]+(:\d+)?/|ssh://[A-Za-z0-9._@-]+(:\d+)?/'
-                         r'|[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:)[A-Za-z0-9._/~-]+$')
+SAFE_REMOTE = re.compile(r'(https://[A-Za-z0-9._-]+(:\d+)?/|ssh://[A-Za-z0-9._@-]+(:\d+)?/'
+                         r'|[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:)[A-Za-z0-9._/~-]+')
 GIT_TIMEOUT = 600
 ASKPASS = Path(__file__).resolve().parent / 'git-askpass.sh'
 
 
 def check_remote(url):
-    if url and not SAFE_REMOTE.match(url):
+    if url and not SAFE_REMOTE.fullmatch(url):
         raise ValueError('clone URL must be https://host/path, ssh://user@host/path '
                          'or user@host:path')
     return url or None
@@ -58,22 +57,24 @@ def check_working_dir(path):
     return str(resolved)
 
 
-def _cleanup_live_files(*_):
-    for path in list(_live_files):
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-    _live_files.clear()
-    for path in list(_live_dirs):
+def _remove(path):
+    _live.discard(path)
+    if os.path.isdir(path):
         shutil.rmtree(path, ignore_errors=True)
-    _live_dirs.clear()
+    else:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
 
 
-atexit.register(_cleanup_live_files)
+def _cleanup_live(*_):
+    for path in list(_live):
+        _remove(path)
+
+
+atexit.register(_cleanup_live)
 for _sig in (signal.SIGTERM, signal.SIGINT):
     try:
-        signal.signal(_sig, lambda s, f: (_cleanup_live_files(), sys.exit(128 + s)))
+        signal.signal(_sig, lambda s, f: (_cleanup_live(), sys.exit(128 + s)))
     except ValueError:
         pass  # not the main thread
 
@@ -115,7 +116,7 @@ def _release(keys):
 
 
 def json_safe(value):
-    """ansible-runner ships extravars as JSON, which has no date type."""
+    """Extra-vars travel as JSON, which has no date type."""
     if isinstance(value, dict):
         return {k: json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -134,35 +135,80 @@ def under(root, candidate):
     return str(path)
 
 
-def runner_kwargs(project, env):
-    """Structured ansible-runner arguments. Nothing stored becomes raw argv."""
+def playbook_argv(project, env, extravars_path=None, key_path=None, inventory_path=None):
+    """ansible-playbook argv from the typed columns. Nothing stored is raw argv:
+    every value is one positional or the operand of a fixed flag, and none may
+    begin with a dash. inventory_path is the one generated from the project's
+    hosts; the environment's own inventory file, if any, is passed as well."""
     for field in ('inventory', 'playbook', 'limit_hosts'):
         value = env[field]
         if value and str(value).startswith('-'):
             raise ValueError(f'{field} may not start with "-": {value}')
     tags = env['tags']
-    if tags and not SAFE_TAGS.match(tags):
+    if tags and not SAFE_TAGS.fullmatch(tags):
         raise ValueError(f'tags may only contain letters, digits, _.:,- : {tags}')
-    kwargs = {
-        'project_dir': str(Path(project['working_dir']).resolve()),
-        'playbook': under(project['working_dir'], env['playbook']),
-        'inventory': under(project['working_dir'], env['inventory']),
-        'limit': env['limit_hosts'] or None,
-        'quiet': True,
-        'rotate_artifacts': 0,
-    }
+    if not env['inventory'] and not inventory_path:
+        raise ValueError('no inventory: set one on the environment or add hosts to the project')
+    argv = [ANSIBLE_PLAYBOOK, under(project['working_dir'], env['playbook'])]
+    if env['inventory']:
+        argv += ['-i', under(project['working_dir'], env['inventory'])]
+    if inventory_path:
+        argv += ['-i', inventory_path]
+    if env['limit_hosts']:
+        argv += ['--limit', env['limit_hosts']]
     if tags:
-        kwargs['cmdline'] = f'--tags {tags}'
-    # ansible-runner spawns through sh, so the venv must be on PATH explicitly -
-    # a systemd unit or cron job will not have it either
-    envvars = {'PATH': VENV_BIN + os.pathsep + os.environ.get('PATH', '')}
+        argv += ['--tags', tags]
+    if extravars_path:
+        argv += ['-e', '@' + extravars_path]     # a file, never the values themselves
+    if key_path:
+        argv += ['--private-key', key_path]
+    return argv
+
+
+def _ansible_env(env, known_hosts=None):
+    out = os.environ.copy()
+    # ansible-playbook finds ansible-connection on PATH; a unit or cron has no venv there
+    out['PATH'] = VENV_BIN + os.pathsep + out.get('PATH', '')
     # a repo ansible.cfg may not turn host key checking off: an unknown host key
     # is how a man in the middle gets the deploy key used against them
-    envvars['ANSIBLE_HOST_KEY_CHECKING'] = 'True'
+    out['ANSIBLE_HOST_KEY_CHECKING'] = 'True'
+    out['ANSIBLE_NOCOLOR'] = '1'
+    # Always set, pinned or not: an environment variable beats the checkout's own
+    # ansible.cfg, so a repo cannot hand itself StrictHostKeyChecking=no, and the
+    # behaviour does not flip with unrelated pinning state. A repo that needs its
+    # own ssh options must set them per host in the inventory, not here.
+    files = ' '.join(filter(None, (known_hosts, '~/.ssh/known_hosts')))
+    out['ANSIBLE_SSH_EXTRA_ARGS'] = (f"-o 'UserKnownHostsFile={files}' "
+                                     '-o StrictHostKeyChecking=yes')
     if env['become']:
-        envvars['ANSIBLE_BECOME'] = 'True'
-    kwargs['envvars'] = envvars
-    return kwargs
+        out['ANSIBLE_BECOME'] = 'True'
+    return out
+
+
+def write_inventory(workdir, hosts):
+    """INI inventory from validated host rows: a line per host, a section per group."""
+    lines = [h['name'] + (f" ansible_host={h['address']}" if h['address'] else '')
+             for h in hosts]
+    groups = {}
+    for h in hosts:
+        for g in filter(None, (h['groups'] or '').split(',')):
+            groups.setdefault(g, []).append(h['name'])
+    for g, names in sorted(groups.items()):
+        lines += [f'[{g}]', *names]
+    path = os.path.join(workdir, 'inventory.ini')
+    Path(path).write_text('\n'.join(lines) + '\n')
+    return path
+
+
+def write_known_hosts(workdir, hosts):
+    """One line per pinned host key; None when nothing is pinned."""
+    lines = [f"{h['address'] or h['name']} {h['ssh_host_key']}" for h in hosts
+             if h['ssh_host_key']]
+    if not lines:
+        return None
+    path = os.path.join(workdir, 'known_hosts')
+    Path(path).write_text('\n'.join(lines) + '\n')
+    return path
 
 
 def _start_job(kind, project_id, environment_id, actor):
@@ -188,18 +234,18 @@ def reap_running():
 
 
 def write_extravars(workdir, extra):
-    """ansible-runner turns extravars= into -e '{json}' argv, readable by every local
-    user in /proc/*/cmdline; a file under env/ becomes -e @file instead."""
-    os.mkdir(os.path.join(workdir, 'env'))
-    path = os.path.join(workdir, 'env', 'extravars')
+    """-e '{json}' on the command line is readable by every local user in
+    /proc/*/cmdline; a 0600 file passed as -e @file is not."""
+    path = os.path.join(workdir, 'extravars.json')
     with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as fh:
         json.dump(json_safe(extra), fh)
+    return path
 
 
 def write_secret_file(text, suffix=''):
     """0600 file in data/run/ (itself 0700), tracked so a signal still cleans it."""
     fd, path = tempfile.mkstemp(dir=str(RUN_DIR), suffix=suffix)
-    _live_files.add(path)
+    _live.add(path)
     with os.fdopen(fd, 'w') as fh:
         fh.write(text)
         if not text.endswith('\n'):
@@ -207,23 +253,25 @@ def write_secret_file(text, suffix=''):
     return path
 
 
-def drop_secret_file(path):
-    _live_files.discard(path)
+def _run(argv, cwd, secret_values=(), env=None, timeout=GIT_TIMEOUT):
+    """Its own process group, so a timeout kills the whole tree. ansible forks a
+    worker per host and each forks ssh; killing only the parent would leave them
+    touching production after the caller has deleted their key file and released
+    the claim that stops a second deploy starting."""
+    ps = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, env=env, start_new_session=True)
     try:
-        os.unlink(path)
-    except OSError:
-        pass
-
-
-def _run(argv, cwd, secret_values=(), env=None):
-    try:
-        ps = subprocess.run(argv, cwd=cwd, capture_output=True, env=env,
-                            timeout=GIT_TIMEOUT)
-    except subprocess.TimeoutExpired as exc:
-        out = ((exc.stdout or b'') + (exc.stderr or b'')).decode('utf-8', 'replace')
-        return 124, redact(out + f'\nkilled after {GIT_TIMEOUT}s', secret_values)
-    out = (ps.stdout + ps.stderr).decode('utf-8', 'replace')
-    return ps.returncode, redact(out, secret_values)
+        out, _ = ps.communicate(timeout=timeout)
+        code = ps.returncode
+    except subprocess.TimeoutExpired:
+        # start_new_session makes the child its own group leader, so the group id
+        # is its pid: never look it up, that fails once the child itself has gone
+        # and would leave the forks it started running unsupervised.
+        with contextlib.suppress(OSError):
+            os.killpg(ps.pid, signal.SIGKILL)
+        out, _ = ps.communicate()
+        code, out = 124, (out or b'') + f'\nkilled after {timeout}s'.encode()
+    return code, redact(out.decode('utf-8', 'replace'), secret_values)
 
 
 def _git_env(pat):
@@ -245,7 +293,7 @@ def _authed_url(remote):
 
 
 def deploy(project, env, store, actor, notify=None):
-    """Run the playbook via ansible-runner, with the encrypted vars as extra-vars."""
+    """Run ansible-playbook with the encrypted vars as an extra-vars file."""
     keys = {f"env:{env['id']}", f"dir:{project['working_dir']}"}
     if not _claim(keys):
         if notify:
@@ -258,21 +306,20 @@ def deploy(project, env, store, actor, notify=None):
         extra = store.extra_vars(project['id'], env['id'])
         ssh = store.cred_resolve('ssh_key', project['id'], env['id'])
         secrets = list(extra.values()) + ([ssh['secret']] if ssh else [])
-        # the extravars file and the ssh key live under here at 0600; keep it
-        # inside data/run/ (0700) and remove the lot afterwards
+        # the extravars file and the ssh key live under data/run/ (0700) at 0600
+        # for the life of the run and are removed however it ends
         workdir = tempfile.mkdtemp(dir=str(RUN_DIR))
-        _live_dirs.add(workdir)
-        write_extravars(workdir, extra)
-        kwargs = runner_kwargs(project, env)
+        _live.add(workdir)
+        vars_path = write_extravars(workdir, extra)
         if ssh:
-            # deliberately not ansible-runner's ssh_key=: that wraps the run in an
-            # ssh-agent which outlives it, leaving the decrypted key resident
+            # a file, never ssh-agent: an agent outlives the run holding the key
             key_path = write_secret_file(ssh['secret'], '.key')
-            kwargs['cmdline'] = ' '.join(filter(None, [
-                kwargs.get('cmdline'), f'--private-key {shlex.quote(key_path)}']))
-        result = ansible_runner.run(private_data_dir=workdir, **kwargs)
-        code = result.rc
-        out = redact(result.stdout.read() if result.stdout else '', secrets)
+        hosts = project_hosts(project['id'])
+        inventory = write_inventory(workdir, hosts) if hosts else None
+        known = write_known_hosts(workdir, hosts) if hosts else None
+        argv = playbook_argv(project, env, vars_path, key_path, inventory)
+        code, out = _run(argv, project['working_dir'], secrets,
+                         env=_ansible_env(env, known), timeout=DEPLOY_TIMEOUT)
     except Exception as exc:
         msg = redact(str(exc), secrets)
         if job_id:
@@ -281,11 +328,9 @@ def deploy(project, env, store, actor, notify=None):
             notify(f"Deployment failed to start: {msg}")
         return job_id
     finally:
-        if key_path:
-            drop_secret_file(key_path)
-        if workdir:
-            _live_dirs.discard(workdir)
-            shutil.rmtree(workdir, ignore_errors=True)
+        for path in (key_path, workdir):
+            if path:
+                _remove(path)
         _release(keys)
     _finish_job(job_id, 'ok' if code == 0 else 'failed', code, out)
     audit(actor, 'deploy', f"{project['name']}/{env['name']} job={job_id} rc={code}")

@@ -15,5 +15,38 @@ daemon user's own key. Leave blank if you check the repo out by hand.</span></p>
 <button>Save</button>
 {% if project %}<button name="delete" value="1" data-confirm="Delete this project, its environments and their secrets?"
   >Delete</button>{% endif %}
-</fieldset></form><p><a href="/">back</a></p>
+</fieldset></form>
+
+{% if project %}
+<h2>Hosts</h2>
+<p class="mask">Written out as the inventory at deploy time: a line per host, a
+<code>[group]</code> section per group. A pinned key goes into a known_hosts file
+for the run, so the first connection is never trust on first use and a changed
+key fails the deploy. Get it with <code>ssh-keyscan -t ed25519 host</code> and
+compare the fingerprint on the console.</p>
+<table><tr><th>Name</th><th>Address</th><th>Groups</th><th>Host key</th><th></th></tr>
+{% for h in hosts %}<tr><td>{{ h.name }}</td><td>{{ h.address or '' }}</td>
+<td>{{ h.groups or '' }}</td>
+<td>{% if h.fingerprint %}<code class="pick">{{ h.fingerprint }}</code>
+{% else %}<span class="mask">not pinned</span>{% endif %}</td>
+<td>{% if is_admin %}<form method="post" action="/host" class="inline">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="project_id" value="{{ project.id }}">
+<input type="hidden" name="name" value="{{ h.name }}">
+<button name="delete" value="1" data-confirm="Remove this host?">delete</button>
+</form>{% endif %}</td></tr>
+{% else %}<tr><td colspan="5">No hosts; the environment's inventory file is used alone.</td></tr>
+{% endfor %}</table>
+{% if is_admin %}<fieldset><legend>Add or update a host</legend>
+<form method="post" action="/host">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="project_id" value="{{ project.id }}">
+<p class="row"><label>Name <input name="name" required pattern="[A-Za-z0-9._-]+"></label>
+<label>Address <input name="address" placeholder="10.0.0.5 or host.example"></label>
+<label>Groups <input name="groups" placeholder="web,db"></label></p>
+<p><textarea name="ssh_host_key" rows="2" cols="70"
+  placeholder="ssh-ed25519 AAAA... (optional; as ssh-keyscan prints it)"></textarea></p>
+<button>Save</button></form></fieldset>{% endif %}
+{% endif %}
+<p><a href="/">back</a></p>
 {% endblock %}

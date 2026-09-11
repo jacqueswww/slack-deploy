@@ -71,8 +71,12 @@ def wrong_password_is_refused():
     reopened.close()
 
 
+def kdf():
+    return json.loads(db.KDF_FILE.read_text())
+
+
 def cipher_settings_are_maxed():
-    conn = db._open_secrets(db.key_from_passphrase(GOOD))
+    key, conn, _ = db.open_store(GOOD)
     try:
         assert conn.execute('PRAGMA cipher_memory_security').fetchone()[0] == '1', \
             'SQLCipher 4 defaults this off; it is what mlocks and wipes key material'
@@ -82,20 +86,21 @@ def cipher_settings_are_maxed():
         assert conn.execute('PRAGMA cipher_plaintext_header_size').fetchone()[0] == '0'
     finally:
         conn.close()
-    _, params = db.read_kdf()
+        db.wipe(key)
+    params = kdf()
     assert params['n'] == 2 ** 18 and params['dklen'] == 32, params
     assert params['maxmem'] >= 128 * params['r'] * params['n'], 'maxmem too low'
 
 
 def stored_kdf_params_win():
     """Raising the module constant must never lock anyone out of an old store."""
-    salt, _ = db.read_kdf()
+    salt = bytes.fromhex(kdf()['salt'])
     weak = dict(db.KEY_SCRYPT, n=2 ** 14, maxmem=64 * 1024 * 1024)
     db.write_kdf(salt, weak)
     try:
-        assert db.read_kdf()[1]['n'] == 2 ** 14
+        assert kdf()['n'] == 2 ** 14
         from_store = db.derive_key(GOOD, salt, weak)
-        assert bytes(from_store) == bytes(db.key_from_passphrase(GOOD)), \
+        assert bytes(from_store) == bytes(db._kdf_key(kdf(), GOOD)), \
             'derivation must use the params on disk, not the current constant'
         assert bytes(from_store) != bytes(db.derive_key(GOOD, salt)), \
             'different params must produce a different key'

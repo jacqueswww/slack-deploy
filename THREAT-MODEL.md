@@ -17,7 +17,8 @@ this repository ships (`deploy/`, `manage.py doctor`), or out of reach.
 3. **Deploy capability.** Running a playbook is running code on every target host
    as the deploy user, usually with `become`.
 4. **Deploy configuration** (`deploy.db`, plaintext): which repo, branch, playbook
-   and inventory run. Changing it turns the next legitimate deploy into a hostile one.
+   and inventory run, and which hosts with which pinned keys. Changing it turns the
+   next legitimate deploy into a hostile one, or points it at an impostor host.
 5. **Web credentials**: scrypt password hashes and TOTP seeds sealed under those
    passwords. Slack user IDs that grant deploy rights through the bot.
 6. **Job logs and audit trail.** Redacted, but hostnames, paths and timing leak.
@@ -86,12 +87,22 @@ this repository ships (`deploy/`, `manage.py doctor`), or out of reach.
   execution as the daemon.
 - Extra-vars go to a 0600 file in a 0700 dir and are passed as `-e @file`, never on
   the command line (`/proc/*/cmdline` is world-readable). The SSH key is a 0600
-  file for the life of the run; never `ssh_key=`, which leaves an `ssh-agent`
-  holding the decrypted key forever. Both are removed on exit, on SIGTERM and at
+  file passed as `--private-key`; never an `ssh-agent`, which would hold the
+  decrypted key after the run. `ansible-playbook` is invoked directly, so nothing
+  writes task results to disk. Both files are removed on exit, on SIGTERM and at
   interpreter exit.
-- `ANSIBLE_HOST_KEY_CHECKING=True` is forced; a repo's `ansible.cfg` cannot turn
-  it off. Under the shipped unit `~/.ssh/known_hosts` is read-only, so a host key
-  must be provisioned before the first deploy, and a changed one fails the run.
+- `ANSIBLE_HOST_KEY_CHECKING=True` and `StrictHostKeyChecking=yes` are forced
+  through the environment, which beats a checkout's own `ansible.cfg`, so a repo
+  cannot switch host key checking off. Host keys are pinned per host in the
+  project's host table and written to a known_hosts file for the run; a first
+  connection is never trust on first use and a changed key fails the deploy.
+  `ANSIBLE_SSH_EXTRA_ARGS` is set on every run, pinned or not, so the guarantee
+  does not depend on unrelated pinning state; the cost is that a repo's own
+  `ssh_extra_args` is overridden, and options like `ProxyJump` must be set per
+  host in the inventory instead. A repo's *inventory* variables still outrank the
+  environment, so repo review remains the control. Hosts with no pin fall back to
+  the daemon user's own `known_hosts`, which the unit mounts read-only
+  (`ReadOnlyPaths=-/var/lib/slack-deploy/.ssh`) so a playbook cannot add to it.
 - Git: remotes must be https, ssh:// or scp-style and `GIT_ALLOW_PROTOCOL=https:ssh`
   is set, so `ext::` cannot run a shell and `file:` cannot clone from elsewhere on
   the box. The PAT reaches git through `GIT_ASKPASS`, never argv or the remote URL.
@@ -115,7 +126,7 @@ this repository ships (`deploy/`, `manage.py doctor`), or out of reach.
   allocator reuses it. What a same-uid process *can* do: read `deploy.db`, write
   to `data/run/` while another deploy is in flight, and, unless the filesystem
   says otherwise, rewrite `src/`, `venv/` and other projects' checkouts. That is
-  why `deploy/slack-deploy-*.service` set `ProtectSystem=strict` with only `data/`,
+  why `deploy/slack-deploy@.service` sets `ProtectSystem=strict` with only `data/`,
   `backups/` and the checkouts writable, drop every capability, forbid new
   privileges and namespaces, and filter syscalls; and why `doctor` flags a code
   tree writable by the uid that runs it.

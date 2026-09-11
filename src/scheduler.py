@@ -7,6 +7,7 @@ import re
 import shutil
 import sqlite3
 import threading
+import time
 import zipfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -76,7 +77,8 @@ def backup(store, day=None):
         tmp_zip = zip_path.with_suffix('.partial')
         with zipfile.ZipFile(tmp_zip, 'w') as zf:
             zf.writestr(KDF_FILE.name, kdf)
-            zf.writestr(SEALED, db.seal(store.backup_key(), payload.getvalue(), aad=kdf))
+            zf.writestr(SEALED, db.seal(db.backup_key(store._key), payload.getvalue(),
+                                        aad=kdf))
         tmp_zip.chmod(0o600)
         tmp_zip.replace(zip_path)
     finally:
@@ -245,13 +247,8 @@ def _dispatch(row, store):
         if row['kind'] == 'backup':
             backup(store)
         elif row['kind'] == 'git-pull':
-            with deploy_conn() as conn:
-                sql = 'SELECT * FROM project'
-                args = ()
-                if row['target_id']:
-                    sql += ' WHERE id=?'
-                    args = (row['target_id'],)
-                projects = [dict(r) for r in conn.execute(sql, args)]
+            projects = [p for p in db.projects()
+                        if not row['target_id'] or p['id'] == row['target_id']]
             if not projects:
                 logger.warning('schedule %s: no project matches target %s',
                                row['id'], row['target_id'])
@@ -263,9 +260,7 @@ def _dispatch(row, store):
         logger.exception('scheduled %s failed', row['kind'])
 
 
-def start(store, stop=None):
-    stop = stop or threading.Event()
-
+def start(store):
     def loop():
         while True:
             try:
@@ -273,9 +268,6 @@ def start(store, stop=None):
                     run_due(store)
             except Exception:
                 logger.exception('scheduler tick failed')
-            if stop.wait(POLL_SECONDS):
-                return
+            time.sleep(POLL_SECONDS)
 
-    thread = threading.Thread(target=loop, daemon=True, name='scheduler')
-    thread.start()
-    return thread, stop
+    threading.Thread(target=loop, daemon=True, name='scheduler').start()

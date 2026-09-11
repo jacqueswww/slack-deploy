@@ -4,10 +4,13 @@ import sys
 import zipfile
 from datetime import date, datetime, timedelta
 
+import argparse
+
 import harness
 from harness import GOOD, WORK
 
 import db
+import manage
 import scheduler
 
 STORE = None
@@ -212,6 +215,61 @@ def restore_swaps_the_data_dir_and_keeps_the_old_one():
         back.close()
 
 
+def import_backs_up_the_current_state_first():
+    """`manage.py import` on an older zip: a -pre-import zip of today's state lands in
+    backups/ and opens with the passphrase, then the zip's contents take over."""
+    store = db.SecretStore.unlock(GOOD)
+    older, _ = scheduler.backup(store, day='older')
+    store.set(db.GLOBAL_SCOPE, 0, 'set_after_older', 'only-in-the-pre-import-zip')
+    store.close()
+    with db.deploy_conn() as conn:
+        conn.execute("UPDATE scheduler_lock SET heartbeat_at=datetime('now','-1 hour')")
+    real_ask, manage.ask_passphrase = manage.ask_passphrase, \
+        lambda *a, **k: bytearray(GOOD.encode())
+    try:
+        manage.cmd_import(argparse.Namespace(zip=str(older), yes=True))
+    finally:
+        manage.ask_passphrase = real_ask
+    safety = sorted(db.BACKUP_DIR.glob('*-pre-import.zip'))
+    assert len(safety) == 1, safety
+    _, payload = scheduler.open_backup(safety[0], GOOD)
+    with payload as zf:
+        assert 'secrets.db' in zf.namelist() and 'deploy.db' in zf.namelist()
+    back = db.SecretStore.unlock(GOOD)
+    try:
+        assert back.get(db.GLOBAL_SCOPE, 0, 'set_after_older') is None, \
+            'data/ must now be the older zip'
+        assert back.get(db.GLOBAL_SCOPE, 0, 'slack_bot_token') == 'xoxb-must-not-leak'
+    finally:
+        back.close()
+    assert scheduler._stamp(safety[0].stem) == date.today(), 'pre-import zips age out too'
+
+
+def a_store_that_cannot_be_opened_does_not_block_an_import():
+    """The states import exists to recover from - a lost password for this machine,
+    a deleted secrets.db - are exactly the ones that cannot be backed up first."""
+    store = db.SecretStore.unlock(GOOD)
+    good_zip, _ = scheduler.backup(store, day='importable')
+    store.close()
+    with db.deploy_conn() as conn:
+        conn.execute("UPDATE scheduler_lock SET heartbeat_at=datetime('now','-1 hour')")
+    db.SECRETS_DB.unlink()                     # the store is now unopenable
+    real_ask, manage.ask_passphrase = manage.ask_passphrase, \
+        lambda *a, **k: bytearray(GOOD.encode())
+    before = set(db.BACKUP_DIR.glob('*-pre-import.zip'))
+    try:
+        manage.cmd_import(argparse.Namespace(zip=str(good_zip), yes=True))
+    finally:
+        manage.ask_passphrase = real_ask
+    assert set(db.BACKUP_DIR.glob('*-pre-import.zip')) == before, \
+        'nothing to back up, but the import must still happen'
+    back = db.SecretStore.unlock(GOOD)
+    try:
+        assert back.get(db.GLOBAL_SCOPE, 0, 'slack_bot_token') == 'xoxb-must-not-leak'
+    finally:
+        back.close()
+
+
 if __name__ == '__main__':
     sys.exit(harness.run(
         backup_covers_the_whole_data_dir, run_dir_is_excluded,
@@ -221,4 +279,6 @@ if __name__ == '__main__':
         schedule_honours_weekdays, only_one_process_owns_the_scheduler,
         restore_refuses_while_the_bot_runs, restore_refuses_a_zip_that_is_not_a_backup,
         a_tampered_or_foreign_backup_refuses_to_restore,
-        restore_swaps_the_data_dir_and_keeps_the_old_one))
+        restore_swaps_the_data_dir_and_keeps_the_old_one,
+        import_backs_up_the_current_state_first,
+        a_store_that_cannot_be_opened_does_not_block_an_import))

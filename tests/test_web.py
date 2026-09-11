@@ -252,6 +252,28 @@ def bad_input_is_a_400_not_a_500():
         assert status == 400, (field, value, status)
 
 
+def admins_maintain_a_projects_hosts():
+    c = CTX['c']
+    status, _, _, _ = c.post('/project', name='hosted', working_dir='/srv/hosted',
+                             branch='main', git_remote='', csrf=CTX['csrf'])
+    assert status in (302, 303), status
+    with db.deploy_conn() as conn:
+        pid = conn.execute("SELECT id FROM project WHERE name='hosted'").fetchone()[0]
+    status, _, _, _ = c.post('/host', project_id=pid, name='web1', address='10.0.0.5',
+                             groups='web', ssh_host_key='', csrf=CTX['csrf'])
+    assert status in (302, 303), status
+    status, _, _, _ = c.post('/host', project_id=pid, name='bad host', csrf=CTX['csrf'])
+    assert status == 400, 'a name with a space would break the generated inventory'
+    status, _, text, _ = c.get(f'/project?id={pid}')
+    assert status == 200 and 'web1' in text and '10.0.0.5' in text and 'not pinned' in text
+    status, _, _, _ = c.post('/host', project_id=pid, name='web1', delete=1, csrf=CTX['csrf'])
+    assert status in (302, 303) and db.hosts(pid) == [], db.hosts(pid)
+    status, _, _, _ = c.post('/host', project_id=pid, name='web1', delete=1, csrf=CTX['csrf'])
+    assert status == 404, 'deleting nothing must not report success or audit a fake event'
+    status, _, _, _ = c.post('/host', project_id=pid, delete=1, csrf=CTX['csrf'])
+    assert status == 404, status
+
+
 def a_password_reset_voids_the_sealed_seed():
     c = CTX['c']
     status, _, _, _ = c.post('/users', username='bob', password='bobs-long-password',
@@ -316,7 +338,8 @@ if __name__ == '__main__':
         wrong_codes_are_throttled, the_code_only_reaches_the_global_password,
         the_global_password_unlocks, only_admins_reveal,
         promotion_bites_on_the_next_request, admins_can_download_a_backup,
-        bad_input_is_a_400_not_a_500, a_password_reset_voids_the_sealed_seed,
+        bad_input_is_a_400_not_a_500, admins_maintain_a_projects_hosts,
+        a_password_reset_voids_the_sealed_seed,
         relock_codes_are_throttled,
         disabling_cuts_the_session_off, orphaned_stores_are_swept)
     # the server thread is not a daemon: without this a failed check hangs the process
