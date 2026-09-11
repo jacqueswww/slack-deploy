@@ -11,7 +11,10 @@
 <p><label>Inventory <input name="inventory" value="{{ env.inventory or '' if env else '' }}"
    placeholder="blank: the project's hosts only"></label></p>
 <p><label>Playbook <input name="playbook" value="{{ env.playbook if env else '' }}" required></label></p>
-<p><label>Tags <input name="tags" value="{{ env.tags or '' if env else '' }}"></label></p>
+<p><label>Tags <input name="tags" value="{{ env.tags or '' if env else '' }}"
+   placeholder="--tags, comma separated"></label></p>
+<p><label>Skip tags <input name="skip_tags" value="{{ env.skip_tags or '' if env else '' }}"
+   placeholder="--skip-tags, comma separated"></label></p>
 <p><label>Limit <input name="limit_hosts" value="{{ env.limit_hosts or '' if env else '' }}"></label></p>
 <p><label><input type="checkbox" name="become" value="1"
   {% if env and env.become %}checked{% endif %}> become (-b)</label></p>

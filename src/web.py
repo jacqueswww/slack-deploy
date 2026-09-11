@@ -444,8 +444,8 @@ class Root:
     # --- environments -----------------------------------------------------
     @cherrypy.expose
     def environment(self, id=None, project_id=None, name=None, inventory=None,
-                    playbook=None, tags=None, limit_hosts=None, become=None,
-                    delete=None, csrf=None):
+                    playbook=None, tags=None, skip_tags=None, limit_hosts=None,
+                    become=None, delete=None, csrf=None):
         if cherrypy.request.method != 'POST':
             return render('environment.html',
                           env=_row('SELECT * FROM environment WHERE id=?', (id,))
@@ -458,33 +458,46 @@ class Root:
             audit(actor(), 'environment-delete', f'id={id}')
             raise cherrypy.HTTPRedirect('/')
         for field, value in (('inventory', inventory), ('playbook', playbook),
-                             ('tags', tags), ('limit_hosts', limit_hosts)):
+                             ('tags', tags), ('skip_tags', skip_tags),
+                             ('limit_hosts', limit_hosts)):
             if value and value.startswith('-'):
                 raise cherrypy.HTTPError(400, f'{field} may not start with "-"')
         args = (project_id, name, inventory or None, playbook, tags or None,
-                limit_hosts or None, 1 if become else 0)
+                skip_tags or None, limit_hosts or None, 1 if become else 0)
         if id:
             _write('UPDATE environment SET project_id=?, name=?, inventory=?, '
-                   'playbook=?, tags=?, limit_hosts=?, become=? WHERE id=?', args + (id,))
+                   'playbook=?, tags=?, skip_tags=?, limit_hosts=?, become=? '
+                   'WHERE id=?', args + (id,))
             audit(actor(), 'environment-update', f'id={id}')
         else:
             new_id = _write('INSERT INTO environment (project_id, name, inventory, '
-                            'playbook, tags, limit_hosts, become) VALUES (?,?,?,?,?,?,?)',
-                            args)
+                            'playbook, tags, skip_tags, limit_hosts, become) '
+                            'VALUES (?,?,?,?,?,?,?,?)', args)
             audit(actor(), 'environment-create', f'id={new_id}')
         raise cherrypy.HTTPRedirect('/')
 
     # --- deploys ----------------------------------------------------------
     @cherrypy.expose
-    def deploy(self, environment_id=None, csrf=None):
+    def deploy(self, environment_id=None, tags=None, skip_tags=None, csrf=None):
+        """tags/skip_tags left blank mean the environment's own; runner validates
+        both, so a hand-made POST cannot get anything else onto the argv."""
         if cherrypy.request.method != 'POST':
             raise cherrypy.HTTPError(405)
         env_row = _row('SELECT e.*, p.name AS project_name FROM environment e '
                        'JOIN project p ON p.id=e.project_id WHERE e.id=?',
                        (environment_id,))
         project = _row('SELECT * FROM project WHERE id=?', (env_row['project_id'],))
+        chosen = {'tags': tags, 'skip_tags': skip_tags}
+        try:
+            runner.playbook_argv(project, runner.with_tags(env_row, **chosen),
+                                 inventory_path='validate-only')
+        except ValueError as exc:
+            raise cherrypy.HTTPError(400, str(exc))
         st, who = store().clone(), actor()
-        runner.spawn(_then_close, st, lambda: runner.deploy(project, env_row, st, who))
+        runner.spawn(_then_close, st,
+                     lambda: runner.deploy(project, env_row, st, who, **chosen))
+        audit(actor(), 'deploy-start',
+              f"env={environment_id} tags={tags or '-'} skip={skip_tags or '-'}")
         raise cherrypy.HTTPRedirect('/')
 
     @cherrypy.expose
@@ -526,14 +539,21 @@ class Root:
     # --- secrets ----------------------------------------------------------
     @cherrypy.expose
     def secrets(self, scope='global', scope_id=0, name=None, value=None, note=None,
-                vartype='string', note_only=None, delete=None, reveal=None, csrf=None):
+                vartype='string', note_only=None, delete=None, reveal=None,
+                export=None, csrf=None):
         scope, scope_id = _scope(scope, scope_id)
         st = store()
-        error = shown = None
+        error = shown = exported = None
         if cherrypy.request.method == 'POST' and reveal:
             require_admin()
             shown = yaml.safe_dump(st.get(scope, scope_id, name))
             audit(actor(), 'secret-reveal', f'{scope}/{scope_id}/{name}')
+        elif cherrypy.request.method == 'POST' and export:
+            # the same plaintext /vars_export downloads, on screen instead, for
+            # a scope small enough to copy by hand
+            require_admin()
+            exported = db.vars_export_text(st, scope, scope_id)
+            audit(actor(), 'vars-export-inline', f'{scope}/{scope_id}')
         elif cherrypy.request.method == 'POST':
             require_admin()
             if delete:
@@ -557,6 +577,7 @@ class Root:
         return render('secrets.html', scope=scope, scope_id=scope_id,
                       secrets=st.names(scope, scope_id),
                       revealed=name if shown else None, shown=shown, error=error,
+                      exported=exported,
                       var_types=db.VAR_TYPES,
                       projects=db.projects(),
                       environments=db.environments())

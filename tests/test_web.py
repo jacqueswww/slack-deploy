@@ -320,6 +320,39 @@ def admins_maintain_a_projects_hosts():
     assert status == 404, status
 
 
+def a_deploy_may_pick_its_tags_and_bad_ones_are_refused():
+    c = CTX['c']
+    with db.deploy_conn() as conn:
+        pid = conn.execute("SELECT id FROM project WHERE name='hosted'").fetchone()[0]
+        eid = conn.execute(
+            'INSERT INTO environment (project_id, name, inventory, playbook, tags, '
+            "skip_tags) VALUES (?,'prod','hosts','site.yml','deploy','slow')",
+            (pid,)).lastrowid
+    status, _, _, _ = c.post('/deploy', environment_id=eid, tags='deploy; rm -rf /',
+                             csrf=CTX['csrf'])
+    assert status == 400, 'a tag override must go through the same gate'
+    status, _, _, _ = c.post('/deploy', environment_id=eid, skip_tags='$(whoami)',
+                             csrf=CTX['csrf'])
+    assert status == 400, status
+    status, _, text, _ = c.get('/environment?id=%d' % eid)
+    assert 'skip_tags' in text, 'the environment form must offer a stored default'
+
+
+def the_export_can_be_shown_for_copy_and_paste():
+    c = CTX['c']
+    status, _, _, _ = c.post('/secrets', scope='global', scope_id=0, name='copyme',
+                             value='paste-this-value', csrf=CTX['csrf'])
+    assert status in (302, 303), status
+    status, _, text, headers = c.post('/secrets', scope='global', scope_id=0,
+                                      export=1, csrf=CTX['csrf'])
+    assert status == 200, status
+    assert '<textarea' in text and 'paste-this-value' in text, 'the yaml must be on screen'
+    assert headers.get('Cache-Control') == 'no-store', headers
+    with db.deploy_conn() as conn:
+        actions = [r[0] for r in conn.execute('SELECT action FROM audit')]
+    assert 'vars-export-inline' in actions, 'showing secrets must be audited'
+
+
 def a_password_reset_voids_the_sealed_seed():
     c = CTX['c']
     status, _, _, _ = c.post('/users', username='bob', password='bobs-long-password',
@@ -387,6 +420,8 @@ if __name__ == '__main__':
         the_global_password_unlocks, only_admins_reveal,
         promotion_bites_on_the_next_request, admins_can_download_a_backup,
         bad_input_is_a_400_not_a_500, admins_maintain_a_projects_hosts,
+        a_deploy_may_pick_its_tags_and_bad_ones_are_refused,
+        the_export_can_be_shown_for_copy_and_paste,
         a_password_reset_voids_the_sealed_seed,
         relock_codes_are_throttled,
         disabling_cuts_the_session_off, orphaned_stores_are_swept)

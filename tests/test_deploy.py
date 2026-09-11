@@ -82,6 +82,35 @@ def argv_is_built_from_structured_fields():
     assert runner._ansible_env(dict(CTX['env'], become=1))['ANSIBLE_BECOME'] == 'True'
 
 
+def a_run_may_choose_its_own_tags():
+    """A deploy picks tags for that run; blank means the environment's own, and
+    an empty string deliberately drops a stored one."""
+    stored = dict(CTX['env'], tags='deploy', skip_tags='migrations')
+    argv = runner.playbook_argv(CTX['project'], stored)
+    assert argv[argv.index('--tags') + 1] == 'deploy'
+    assert argv[argv.index('--skip-tags') + 1] == 'migrations'
+
+    override = runner.with_tags(stored, tags='config,web', skip_tags='slow')
+    argv = runner.playbook_argv(CTX['project'], override)
+    assert argv[argv.index('--tags') + 1] == 'config,web'
+    assert argv[argv.index('--skip-tags') + 1] == 'slow'
+
+    assert runner.with_tags(stored)['tags'] == 'deploy', 'None keeps the stored one'
+    cleared = runner.playbook_argv(CTX['project'],
+                                   runner.with_tags(stored, tags='', skip_tags=''))
+    assert '--tags' not in cleared and '--skip-tags' not in cleared, cleared
+
+    # an override is validated by the same gate the stored value goes through
+    for field in ('tags', 'skip_tags'):
+        for bad in ('deploy; rm -rf /', '$(whoami)', 'a b', 'ok\n'):
+            try:
+                runner.playbook_argv(CTX['project'],
+                                     runner.with_tags(stored, **{field: bad}))
+                raise AssertionError(f'{field}={bad!r} must be rejected')
+            except ValueError:
+                pass
+
+
 def git_remotes_are_https_or_ssh_only():
     """ext:: runs a shell, file: and bare paths clone from anywhere on the box."""
     for ok in ('https://github.com/org/repo.git', 'ssh://git@host/org/repo',
@@ -400,7 +429,7 @@ def a_second_deploy_is_refused_while_one_runs():
 if __name__ == '__main__':
     sys.exit(harness.run(
         argv_is_built_from_structured_fields, stored_fields_cannot_become_raw_argv,
-        git_remotes_are_https_or_ssh_only,
+        git_remotes_are_https_or_ssh_only, a_run_may_choose_its_own_tags,
         dates_survive_json_extravars, a_real_playbook_runs,
         secrets_are_redacted_from_the_log, nested_and_escaped_values_are_redacted_too,
         extravars_never_touch_argv, no_process_ever_carries_the_secret,

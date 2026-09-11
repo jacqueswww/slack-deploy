@@ -14,8 +14,11 @@ token held in an encrypted store that only a human-typed passphrase can open.
   (string, int, float, bool, date, yaml). Environment values override project
   values; global values never reach Ansible. SSH deploy keys and GitHub PATs are
   stored alongside and resolved narrowest scope first.
-- **Structured environments.** Inventory, playbook, tags, limit and become are
-  separate fields. No free-text argument string ever reaches `ansible-playbook`.
+- **Structured environments.** Inventory, playbook, tags, skip-tags, limit and
+  become are separate fields. No free-text argument string ever reaches
+  `ansible-playbook`. A run can pick its own `--tags` and `--skip-tags` without
+  changing what the environment stores, from the dashboard or from Slack
+  (`deploy shop/prod tags=config skip=slow`).
 - **Hosts per project.** Name, address, groups and an optional pinned SSH host
   key. Written out as the inventory for each run, alone or beside the
   environment's inventory file, and as a known_hosts file, so a changed host key

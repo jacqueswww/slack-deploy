@@ -135,6 +135,22 @@ def under(root, candidate):
     return str(path)
 
 
+def with_tags(env, tags=None, skip_tags=None):
+    """The environment, with this run's own tag choices laid over it.
+
+    None means "whatever the environment stores"; the empty string means
+    deliberately none, which is how a run drops a stored tag and plays the whole
+    playbook. Nothing is validated here - playbook_argv is the one gate every
+    path goes through, so an override cannot slip past it.
+    """
+    out = dict(env)          # always a dict: a sqlite3.Row has no .get()
+    if tags is not None:
+        out['tags'] = tags or None
+    if skip_tags is not None:
+        out['skip_tags'] = skip_tags or None
+    return out
+
+
 def playbook_argv(project, env, extravars_path=None, key_path=None, inventory_path=None):
     """ansible-playbook argv from the typed columns. Nothing stored is raw argv:
     every value is one positional or the operand of a fixed flag, and none may
@@ -145,8 +161,11 @@ def playbook_argv(project, env, extravars_path=None, key_path=None, inventory_pa
         if value and str(value).startswith('-'):
             raise ValueError(f'{field} may not start with "-": {value}')
     tags = env['tags']
-    if tags and not SAFE_TAGS.fullmatch(tags):
-        raise ValueError(f'tags may only contain letters, digits, _.:,- : {tags}')
+    skip_tags = env['skip_tags'] if 'skip_tags' in env.keys() else None
+    for field, value in (('tags', tags), ('skip_tags', skip_tags)):
+        if value and not SAFE_TAGS.fullmatch(value):
+            raise ValueError(
+                f'{field} may only contain letters, digits, _.:,- : {value}')
     if not env['inventory'] and not inventory_path:
         raise ValueError('no inventory: set one on the environment or add hosts to the project')
     argv = [ANSIBLE_PLAYBOOK, under(project['working_dir'], env['playbook'])]
@@ -158,6 +177,8 @@ def playbook_argv(project, env, extravars_path=None, key_path=None, inventory_pa
         argv += ['--limit', env['limit_hosts']]
     if tags:
         argv += ['--tags', tags]
+    if skip_tags:
+        argv += ['--skip-tags', skip_tags]
     if extravars_path:
         argv += ['-e', '@' + extravars_path]     # a file, never the values themselves
     if key_path:
@@ -292,8 +313,11 @@ def _authed_url(remote):
     return remote
 
 
-def deploy(project, env, store, actor, notify=None):
-    """Run ansible-playbook with the encrypted vars as an extra-vars file."""
+def deploy(project, env, store, actor, notify=None, tags=None, skip_tags=None):
+    """Run ansible-playbook with the encrypted vars as an extra-vars file.
+
+    tags/skip_tags override what the environment stores, for this run only."""
+    env = with_tags(env, tags, skip_tags)
     keys = {f"env:{env['id']}", f"dir:{project['working_dir']}"}
     if not _claim(keys):
         if notify:
@@ -333,7 +357,8 @@ def deploy(project, env, store, actor, notify=None):
                 _remove(path)
         _release(keys)
     _finish_job(job_id, 'ok' if code == 0 else 'failed', code, out)
-    audit(actor, 'deploy', f"{project['name']}/{env['name']} job={job_id} rc={code}")
+    audit(actor, 'deploy', f"{project['name']}/{env['name']} job={job_id} rc={code} "
+                           f"tags={env['tags'] or '-'} skip={env.get('skip_tags') or '-'}")
     if notify:
         notify('Deployment done' if code == 0 else 'Deployment failed', out)
     return job_id

@@ -15,7 +15,8 @@ from db import GLOBAL_SCOPE, audit, deploy_conn
 
 logger = logging.getLogger(__name__)
 
-HELP = ('Commands: `list`, `deploy <project>/<env>`, `refresh-repos [project]`')
+HELP = ('Commands: `list`, `deploy <project>/<env> [tags=a,b] [skip=c]`, '
+        '`refresh-repos [project]`')
 
 
 def _notifier(web_client, payload):
@@ -60,7 +61,11 @@ def handle(store, client, req):
         notify(HELP)
         return
     command = words[0].lower() if words else ''
-    arg = words[1] if len(words) > 1 else None
+    # key=value, never -flags: a leading dash is what playbook_argv refuses, and
+    # accepting one here would only produce a confusing error further in
+    options = dict(w.split('=', 1) for w in words[1:] if '=' in w)
+    plain = [w for w in words[1:] if '=' not in w]
+    arg = plain[0] if plain else None
 
     if command not in ('list', 'deploy', 'refresh-repos', 'help'):
         notify(HELP)
@@ -89,8 +94,13 @@ def handle(store, client, req):
             notify(f'Environment not found or ambiguous: {arg}')
             return
         project = db.projects(env['project_name'])[0]
-        notify(f"Starting deployment for {env['project_name']}/{env['name']}")
-        runner.spawn(runner.deploy, project, env, store, actor, notify)
+        tags, skip = options.get('tags'), options.get('skip')
+        chosen = ''.join(
+            f' {label} {value}' for label, value in
+            (('--tags', tags), ('--skip-tags', skip)) if value)
+        notify(f"Starting deployment for {env['project_name']}/{env['name']}{chosen}")
+        runner.spawn(runner.deploy, project, env, store, actor, notify,
+                     tags=tags, skip_tags=skip)
     elif command == 'refresh-repos':
         projects = db.projects(arg)
         if not projects:
