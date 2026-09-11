@@ -116,6 +116,28 @@ def a_real_browser_can_actually_log_in():
     web._failures.clear()
 
 
+def nothing_destructive_submits_without_asking():
+    """A delete here is not recoverable: a secret value is gone unless a backup
+    has it, and one credential per scope and kind means generating or pasting
+    replaces the private key that was there."""
+    import re
+    from pathlib import Path
+    templates = Path(__file__).resolve().parent.parent / 'src' / 'templates'
+    unguarded = []
+    for page in sorted(templates.glob('*.html')):
+        for tag in re.findall(r'<button[^>]*>', page.read_text(), re.S):
+            destructive = any(
+                f'name="{name}"' in tag for name in ('delete', 'generate')
+            )
+            if destructive and 'data-confirm' not in tag:
+                unguarded.append(f'{page.name}: {" ".join(tag.split())[:70]}')
+    assert not unguarded, 'destructive buttons with no confirmation: ' + str(unguarded)
+    # and the handler that reads the attribute is still wired up
+    layout = (templates / 'layout.html').read_text()
+    assert "data-confirm" in layout and 'closest' in layout, \
+        'the delegated confirm handler must still be in the page'
+
+
 def plain_http_off_loopback_is_refused():
     for host in ('0.0.0.0', '10.0.0.5', 'deploy.example'):
         try:
@@ -355,6 +377,7 @@ def orphaned_stores_are_swept():
 if __name__ == '__main__':
     code = harness.run(
         anonymous_is_sent_to_login, a_real_browser_can_actually_log_in,
+        nothing_destructive_submits_without_asking,
         plain_http_off_loopback_is_refused,
         unknown_users_cost_the_same_as_wrong_passwords, lockouts_escalate_until_a_success,
         wrong_passwords_are_throttled,

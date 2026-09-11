@@ -8,7 +8,8 @@
 <td>{% if is_admin %}<form method="post" action="/schedules" class="inline">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <input type="hidden" name="id" value="{{ s.id }}">
-<button name="delete" value="1">delete</button></form>{% endif %}</td></tr>
+<button name="delete" value="1" data-confirm="Delete this schedule?"
+  >delete</button></form>{% endif %}</td></tr>
 {% else %}<tr><td colspan="7">Nothing scheduled.</td></tr>{% endfor %}</table>
 {% if is_admin %}<fieldset><legend>Download a backup</legend>
 <p>Writes and downloads a fresh zip. Everything in it is sealed under the global password:
