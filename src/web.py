@@ -158,9 +158,16 @@ def guard():
     s = cherrypy.session
 
     if cherrypy.request.method == 'POST':
+        # A browser sends the literal "null" rather than an origin whenever the
+        # referrer policy is no-referrer (Fetch, "append a request Origin
+        # header"), and for sandboxed documents. It carries no information about
+        # who sent this, so it cannot be compared; the CSRF token below and
+        # SameSite=Strict are what actually stand between us and another site.
+        # Rejecting it made every real browser unable to log in at all.
         origin = cherrypy.request.headers.get('Origin')
-        if origin and origin.split('//')[-1] != cherrypy.request.headers.get('Host'):
-            raise cherrypy.HTTPError(403, 'cross-origin POST rejected')
+        if origin and origin != 'null':
+            if origin.split('//')[-1] != cherrypy.request.headers.get('Host'):
+                raise cherrypy.HTTPError(403, 'cross-origin POST rejected')
         if path not in PUBLIC:
             sent = cherrypy.request.params.get('csrf')
             if not sent or not pysecrets.compare_digest(str(sent), s.get('csrf') or ''):
@@ -212,7 +219,11 @@ def harden():
         'Cache-Control': 'no-store',
         'X-Frame-Options': 'DENY',
         'X-Content-Type-Options': 'nosniff',
-        'Referrer-Policy': 'no-referrer',
+        # same-origin, not no-referrer: the latter makes a browser send
+        # "Origin: null" on every POST, which the guard cannot check against
+        # anything. Nothing here links out and no URL carries a secret, so this
+        # gives up nothing.
+        'Referrer-Policy': 'same-origin',
         'Content-Security-Policy': (
             f"default-src 'none'; script-src {src}; style-src {src}; img-src 'self'; "
             "connect-src 'self'; form-action 'self'; frame-ancestors 'none'; "

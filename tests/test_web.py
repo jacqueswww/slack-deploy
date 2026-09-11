@@ -24,9 +24,10 @@ class Client:
     def __init__(self, port):
         self.port, self.cookie = port, None
 
-    def request(self, method, path, data=None):
+    def request(self, method, path, data=None, extra=None):
         conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=60)
         headers = {'Cookie': self.cookie} if self.cookie else {}
+        headers.update(extra or {})
         body = None
         if data is not None:
             body = urllib.parse.urlencode(data)
@@ -78,7 +79,7 @@ def anonymous_is_sent_to_login():
     assert status in (302, 303) and location.endswith('/login'), (status, location)
     assert headers.get('Cache-Control') == 'no-store', headers
     assert headers.get('X-Frame-Options') == 'DENY', headers
-    assert headers.get('Referrer-Policy') == 'no-referrer', headers
+    assert headers.get('Referrer-Policy') == 'same-origin', headers
     assert "script-src 'none'" in headers.get('Content-Security-Policy', ''), headers
     status, _, text, headers = c.get('/login')
     nonce = re.search(r'<script nonce="([^"]+)">', text).group(1)
@@ -90,6 +91,29 @@ def anonymous_is_sent_to_login():
     assert status == 200 and 'Cache-Control' not in headers, 'static is public and cacheable'
     status, _, _, _ = c.get('/static/jquery.min.js')
     assert status == 404, 'no third-party script'
+
+
+def a_real_browser_can_actually_log_in():
+    """Regression: Referrer-Policy: no-referrer makes a browser send
+    "Origin: null" on every POST (Fetch, "append a request Origin header"), and
+    rejecting that 403'd the login form in every real browser. curl sends no
+    Origin at all, which is why nothing here noticed."""
+    c = CTX['c']
+    status, _, _, headers = c.get('/login')
+    assert headers.get('Referrer-Policy') == 'same-origin', headers.get('Referrer-Policy')
+    status, location, _, _ = c.request(
+        'POST', '/login', {'username': 'alice', 'password': PASSWORD},
+        extra={'Origin': 'null'})
+    assert status in (302, 303), f'a null origin must not be refused: {status}'
+    status, _, text, _ = c.request(
+        'POST', '/login', {'username': 'alice', 'password': PASSWORD},
+        extra={'Origin': 'http://evil.example'})
+    assert status == 403 and 'cross-origin' in text, 'a real other origin still goes'
+    status, location, _, _ = c.request(
+        'POST', '/login', {'username': 'alice', 'password': PASSWORD},
+        extra={'Origin': f'http://127.0.0.1:{c.port}'})
+    assert status in (302, 303), 'our own origin must pass'
+    web._failures.clear()
 
 
 def plain_http_off_loopback_is_refused():
@@ -330,7 +354,8 @@ def orphaned_stores_are_swept():
 
 if __name__ == '__main__':
     code = harness.run(
-        anonymous_is_sent_to_login, plain_http_off_loopback_is_refused,
+        anonymous_is_sent_to_login, a_real_browser_can_actually_log_in,
+        plain_http_off_loopback_is_refused,
         unknown_users_cost_the_same_as_wrong_passwords, lockouts_escalate_until_a_success,
         wrong_passwords_are_throttled,
         the_password_only_reaches_the_2fa_prompt, the_seed_is_sealed_on_first_login,
