@@ -281,9 +281,11 @@ def cmd_unlock(args):
 
 def cmd_status(args):
     try:
-        print(unlock.ask('status'))
+        reply = unlock.ask('status')
     except OSError as exc:
         raise SystemExit(f'cannot reach the daemon on {unlock.SOCKET}: {exc}')
+    print(reply)
+    return 1 if reply.startswith('error:') else 0
 
 
 def cmd_web(args):

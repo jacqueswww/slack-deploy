@@ -51,7 +51,9 @@ jobs:
       - name: Build tooling
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq debhelper python3-venv python3-pip
+          # build-essential is an implicit build dependency dpkg always checks
+          # for, and it is what brings in fakeroot for Rules-Requires-Root
+          sudo apt-get install -y -qq debhelper build-essential python3-venv python3-pip
 
       - name: Build the .deb
         run: dpkg-buildpackage -us -uc -b

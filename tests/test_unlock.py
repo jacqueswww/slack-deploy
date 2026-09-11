@@ -89,6 +89,19 @@ def the_cli_talks_to_the_module_not_a_shadow():
     assert callable(manage.unlock_store), 'the passphrase helper keeps its own name'
 
 
+def the_cli_exits_non_zero_when_the_socket_refuses():
+    """`hoisty status` as a non-root user gets a refusal; printing it and
+    exiting 0 would tell a script the daemon is fine."""
+    import manage
+    strict = db.DATA.parent / 'run' / 'exitcode.sock'
+    unlock.serve(unlock.Gate(), strict)           # root only, and we are not
+    real, unlock.SOCKET = unlock.SOCKET, strict
+    try:
+        assert manage.cmd_status(None) == 1, 'a refusal must be a failure exit'
+    finally:
+        unlock.SOCKET = real
+
+
 def a_missing_daemon_is_an_error_not_a_traceback():
     try:
         unlock.ask('status', path=db.DATA.parent / 'run' / 'nope.sock')
@@ -118,4 +131,5 @@ if __name__ == '__main__':
         a_wrong_password_leaves_it_locked, rubbish_is_refused_without_touching_the_gate,
         the_right_password_unlocks_the_daemon, every_attempt_is_audited,
         the_passphrase_is_wiped_after_it_is_sent, the_cli_talks_to_the_module_not_a_shadow,
+        the_cli_exits_non_zero_when_the_socket_refuses,
         a_missing_daemon_is_an_error_not_a_traceback, sd_notify_is_a_no_op_off_systemd))
