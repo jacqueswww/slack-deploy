@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+  remove|deconfigure)
+    for instance in bot web; do
+      systemctl stop "hoisty@$instance.service" >/dev/null 2>&1 || true
+    done
+    ;;
+esac
+
+#DEBHELPER#
+exit 0

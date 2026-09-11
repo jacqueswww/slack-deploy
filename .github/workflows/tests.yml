@@ -42,3 +42,54 @@ jobs:
             | venv/bin/python manage.py import --yes "backups/$(date +%F).zip"
           test -f data/secrets.db
           ls backups/*-pre-import.zip
+
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq debhelper python3-venv python3-pip
+
+      - name: Build the .deb
+        run: dpkg-buildpackage -us -uc -b
+
+      # a venv built in the build root carries that path in its scripts unless
+      # the relocation in debian/rules worked
+      - name: Nothing points back at the build root
+        run: |
+          DEB=$(ls ../hoisty_*.deb)
+          dpkg-deb -I "$DEB"
+          mkdir -p /tmp/x && dpkg-deb -x "$DEB" /tmp/x
+          ! grep -rlI -- "$GITHUB_WORKSPACE" /tmp/x/var/lib/hoisty/venv
+          head -2 /tmp/x/var/lib/hoisty/venv/bin/ansible-playbook | grep -q /var/lib/hoisty/venv
+
+      - name: Install it
+        run: sudo apt-get install -y ../hoisty_*.deb
+
+      # the invariant the whole design rests on: the service account must not be
+      # able to rewrite the program that is next handed the global password
+      - name: The service account cannot write the program
+        run: |
+          sudo -u hoisty test ! -w /var/lib/hoisty/app
+          sudo -u hoisty test ! -w /var/lib/hoisty/venv
+          sudo -u hoisty test -w /var/lib/hoisty/data
+          sudo -u hoisty test -w /var/lib/hoisty/backups
+          dpkg -V hoisty
+
+      - name: The packaged CLI runs and the daemons start locked
+        run: |
+          sudo -u hoisty hoisty --help
+          printf 'a shared passphrase long enough\na shared passphrase long enough\nci\nci-password-long-enough\nci-password-long-enough\n' \
+            | sudo -u hoisty hoisty init
+          sudo -u hoisty hoisty doctor || true
+          sudo systemctl start hoisty@bot
+          sleep 3
+          systemctl is-active hoisty@bot
+          test "$(sudo hoisty status)" = "locked"
+          # only root may drive the unlock socket
+          ! sudo -u hoisty hoisty status
+          printf 'a shared passphrase long enough\n' | sudo hoisty unlock
+          test "$(sudo hoisty status)" = "unlocked"

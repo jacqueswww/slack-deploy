@@ -12,8 +12,9 @@ import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-WORK = Path(tempfile.mkdtemp(prefix='slack-deploy-tests-'))
-os.environ['SLACK_DEPLOY_DATA'] = str(WORK / 'data')
+WORK = Path(tempfile.mkdtemp(prefix='hoisty-tests-'))
+os.environ['HOISTY_DATA'] = str(WORK / 'data')
+os.environ['HOISTY_RUNTIME'] = str(WORK / 'run')
 sys.path[:0] = [str(ROOT / 'src'), str(ROOT)]
 
 GOOD = 'a shared passphrase long enough'

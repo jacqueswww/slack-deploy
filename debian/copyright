@@ -1,0 +1,13 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: hoisty
+
+Files: *
+Copyright: the hoisty authors
+License: proprietary
+ All rights reserved. Internal deployment tooling; not for redistribution.
+
+Files: var/lib/hoisty/venv/*
+Copyright: the respective upstream authors
+License: various
+ The vendored virtualenv contains third-party Python packages, each under its
+ own licence. See requirements.txt for the exact pinned set.

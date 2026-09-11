@@ -38,7 +38,7 @@ def totp_rejects_rubbish():
 def totp_uri():
     secret = db.new_totp_secret()
     uri = db.totp_uri(secret, 'jacques@example')
-    assert uri.startswith('otpauth://totp/slack-deploy:'), uri
+    assert uri.startswith('otpauth://totp/hoisty:'), uri
     assert f'secret={secret}' in uri and 'digits=6' in uri and 'period=30' in uri
     assert '@' not in uri.split('?')[0].split(':')[-1], 'the label must be url encoded'
 

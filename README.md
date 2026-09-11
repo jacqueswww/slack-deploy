@@ -1,4 +1,4 @@
-# slack-deploy
+# hoisty
 
 Runs Ansible playbooks from Slack or a web UI, with every variable, SSH key and
 token held in an encrypted store that only a human-typed passphrase can open.
@@ -34,9 +34,11 @@ token held in an encrypted store that only a human-typed passphrase can open.
   derived by scrypt N=2^18 from a 20+ character passphrase; `deploy.db` holds
   configuration, scrypt password hashes and TOTP seeds sealed under each user's
   password.
-- The passphrase is typed at bot start and at each web login. It is never on
-  disk, in argv or in a log. The web process holds a key only inside a session:
-  2 hour hard limit, 5 minute idle relock on a 2FA code.
+- The daemons start locked and hold nothing. The passphrase reaches them over a
+  root-only unix socket (`hoisty unlock`), never a tty, a file or a command line,
+  so a stolen disk image yields nothing and a reboot needs a human. The web
+  process holds a key only inside a session: 2 hour hard limit, 5 minute idle
+  relock on a 2FA code.
 - Web login is password, then TOTP, then the passphrase. Lockouts per factor
   escalate from 5 minutes to 1 hour. Plain HTTP is refused off loopback.
   CSP with per-request nonce, no third-party script.
@@ -51,71 +53,96 @@ Full analysis, residual risks and deployment requirements: [THREAT-MODEL.md](THR
 
 ## Requirements
 
-- Linux, Python 3.12, git 2.x, a Slack app with Socket Mode. Ansible is installed
-  into the venv.
+- Ubuntu 24.04 LTS or newer. Only LTS releases are supported; the package
+  vendors a virtualenv built against that release's Python, so build one .deb
+  per release.
+- git, openssh-client, and a Slack app with Socket Mode. Ansible ships inside
+  the package.
 - Target hosts reachable over SSH from the deploy box.
 
-## Setup
+## Install
+
+```
+sudo apt install ./hoisty_0.1.0_amd64.deb
+```
+
+Everything lands under `/var/lib/hoisty`: `app/` and `venv/` root-owned,
+`data/`, `backups/` and `projects/` owned by the `hoisty` service account. The
+CLI is `/usr/bin/hoisty`; it points at the packaged store automatically.
+
+```
+# 1. create the store and the first admin (as the service account)
+sudo -u hoisty hoisty init
+
+# 2. a project, its deploy key, its hosts and its variables
+sudo -u hoisty hoisty project-add myproj --dir /var/lib/hoisty/projects/myproj \
+    --remote https://github.com/org/myproj.git --branch main
+sudo -u hoisty hoisty cred-gen deploy-key --project myproj   # prints the public key
+sudo -u hoisty hoisty host-add myproj web1 --address 10.0.0.5 --groups web \
+    --key "$(ssh-keyscan -t ed25519 10.0.0.5 2>/dev/null | cut -d' ' -f2-)"
+sudo -u hoisty hoisty secret-set db_password --project myproj --env prod
+sudo -u hoisty hoisty sync
+
+# 3. must print "no problems found" before anything is enabled
+sudo -u hoisty hoisty doctor
+
+# 4. start. Both daemons come up locked and do nothing until unlocked.
+systemctl enable --now hoisty@bot hoisty@web
+sudo hoisty unlock
+```
+
+Environments are created in the web UI (admin). Every user registers 2FA on
+first web login by typing the shown secret into their authenticator. Reach the
+web UI over `ssh -L 8080:127.0.0.1:8080 deploybox`.
+
+## Unlocking
+
+The global password is never stored, so the daemons cannot start themselves
+after a reboot. They come up *locked* and completely inert, which is safe
+because the Slack tokens are inside the encrypted store too:
+
+```
+$ systemctl status hoisty@bot
+  Active: active (running)
+  Status: "locked - waiting for: hoisty unlock"
+
+$ sudo hoisty unlock
+Global password: ********
+ok
+
+$ hoisty status
+unlocked
+```
+
+`hoisty unlock` talks to `/run/hoisty/unlock.sock`. Only uid 0 may drive it: the
+socket is 0600 inside a 0700 directory, and the daemon checks the peer's
+credentials as well, because a playbook that goes bad runs as the service
+account. The passphrase never touches a tty, a file or a command line.
+
+## Running from a checkout
+
+For development, without the package:
 
 ```
 make setup                     # ./venv from the hash-pinned requirements.txt
 make init                      # data/, both databases, the first admin
-python manage.py project-add myproj --dir /srv/ansible/myproj \
-    --remote https://github.com/org/myproj.git --branch main
-python manage.py cred-gen deploy-key --project myproj    # prints the public key
-python manage.py host-add myproj web1 --address 10.0.0.5 --groups web \
-    --key "$(ssh-keyscan -t ed25519 10.0.0.5 2>/dev/null | cut -d' ' -f2-)"
-python manage.py secret-set db_password --project myproj --env prod
-python manage.py sync          # clone the repo
-make bot                       # prompts for the passphrase, stays up
-make web                       # 127.0.0.1:8080, reach over an SSH forward
-make doctor                    # permissions, ownership, host posture
+make bot                       # starts locked
+python manage.py unlock        # in a second shell
+make web                       # 127.0.0.1:8080
+make test                      # every test file, one process each
+make deb                       # build the package (needs network and dpkg-dev)
 ```
 
-Environments are created in the web UI (admin). Every user registers 2FA on
-first web login by typing the shown secret into their authenticator.
+## Production notes
 
-## Production
+`doctor` only reports, it changes nothing. It passes when the service account
+owns `data/`, `backups/` and `projects/` (0700) and nothing else: `app/` and
+`venv/` belong to root, so a playbook that goes bad cannot rewrite the program
+that is next handed the passphrase. The unit enforces the same at runtime with
+`ProtectSystem=strict`, which mounts everything except those three paths
+read-only for the running daemon, and `dpkg -V hoisty` (which `doctor` runs)
+reports any packaged file that has changed since install.
 
-`doctor` only reports, it changes nothing. It passes when the daemon's uid owns
-`data/` and `backups/` (0700) and nothing else: the checkout and `venv/` belong
-to root, so a playbook that goes bad cannot rewrite the program that is next
-handed the passphrase. The unit adds `ProtectSystem=strict`, which mounts
-everything except the data paths read-only for the running daemon. As root:
-
-```
-# 1. service account; data, backups and checkouts are the only paths it owns
-useradd --system --home-dir /var/lib/slack-deploy --create-home \
-    --shell /usr/sbin/nologin slack-deploy
-install -d -o slack-deploy -g slack-deploy -m 700 \
-    /var/lib/slack-deploy/data /var/lib/slack-deploy/backups /srv/ansible
-
-# 2. code and venv: root-owned, world-readable, writable by nobody else
-git clone https://github.com/jacqueswww/slack-deploy /opt/slack-deploy
-cd /opt/slack-deploy && make setup && chmod -R go-w /opt/slack-deploy
-
-# 3. every manage.py command runs as the daemon uid against its data dir
-SD="sudo -u slack-deploy -H env SLACK_DEPLOY_DATA=/var/lib/slack-deploy/data \
-    /opt/slack-deploy/venv/bin/python /opt/slack-deploy/manage.py"
-$SD init
-
-# 4. kernel settings and units (doctor checks for both)
-install -m 644 deploy/sysctl-slack-deploy.conf /etc/sysctl.d/60-slack-deploy.conf
-sysctl --system
-cp deploy/slack-deploy@.service /etc/systemd/system/
-cp -r deploy/slack-deploy@bot.service.d /etc/systemd/system/
-systemctl daemon-reload
-
-# 5. must print "no problems found" before anything is enabled
-$SD doctor
-
-# 6. start. The bot waits for the passphrase on tty12, after every (re)start;
-#    change TTYPath in the drop-in for a serial console
-systemctl enable --now slack-deploy@web slack-deploy@bot
-```
-
-Use `$SD` for all later admin commands (`project-add`, `secret-set`, `sync`,
-`backup`, ...). Reach the web UI over `ssh -L 8080:127.0.0.1:8080 deploybox`.
 Findings doctor still lists after this are host posture (swap on disk, IOMMU
 off, unmitigated CPU bugs) and need a kernel or BIOS change, not a chmod.
 
@@ -135,7 +162,8 @@ python manage.py user-add alice --slack-id U0123456 --admin
 | Command | Purpose |
 |---|---|
 | `init`, `migrate`, `doctor` | Create the store, apply migrations, check the host |
-| `bot`, `web [--tls-cert --tls-key]` | Run the daemons |
+| `bot`, `web [--tls-cert --tls-key]` | Run the daemons (both start locked) |
+| `unlock`, `status` | Give the running daemon the password; ask if it is locked |
 | `user-add`, `user-list`, `user-reset-2fa` | Web and Slack users |
 | `secret-set`, `secret-list`, `vars-import`, `vars-export` | Variables per scope (`--project`, `--env`) |
 | `cred-set`, `cred-gen`, `cred-list`, `cred-rm` | SSH keys and GitHub PATs |
@@ -148,9 +176,10 @@ python manage.py user-add alice --slack-id U0123456 --admin
 
 ```
 make test              # every file, one process each
-make test T=web        # one file: auth, backup, credentials, crypto, deploy, migrate, variables, web
+make test T=web        # one file: auth, backup, credentials, crypto, deploy,
+                       # migrate, unlock, variables, web
 ```
 
 `test_deploy.py` runs a real playbook against localhost and scans `/proc` for
-leaked secrets and stray ssh-agents. Layout and invariants for contributors:
-`AGENTS.md`.
+leaked secrets, stray ssh-agents and orphaned forks. Layout and invariants for
+contributors: `AGENTS.md`.

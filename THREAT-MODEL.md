@@ -9,8 +9,11 @@ this repository ships (`deploy/`, `manage.py doctor`), or out of reach.
 ## Assets, most to least valuable
 
 1. **The global passphrase and the key derived from it.** Opens `secrets.db`.
-   Exists as a bytearray in the bot process for its lifetime and in the web
-   process per unlocked session. Never on disk, never in argv, never logged.
+   Reaches the bot over the root-only unlock socket and the web app through a
+   login form; exists as a bytearray in the bot for its lifetime and in the web
+   process per unlocked session. Never on disk, never in argv, never logged, and
+   never on a tty. Nothing on the machine can reconstruct it, which is why a
+   reboot leaves both daemons locked until a human unlocks them.
 2. **`secrets.db` contents.** Ansible extra-vars (database passwords, API keys),
    SSH deploy keys, GitHub PATs, Slack tokens. SQLCipher, AES-256-CBC + HMAC-SHA512,
    key from scrypt N=2^18 over a 20+ character passphrase.
@@ -102,7 +105,9 @@ this repository ships (`deploy/`, `manage.py doctor`), or out of reach.
   host in the inventory instead. A repo's *inventory* variables still outrank the
   environment, so repo review remains the control. Hosts with no pin fall back to
   the daemon user's own `known_hosts`, which the unit mounts read-only
-  (`ReadOnlyPaths=-/var/lib/slack-deploy/.ssh`) so a playbook cannot add to it.
+  so a playbook cannot add to it: the unit's `ReadWritePaths` lists only
+  `data/`, `backups/` and `projects/`, and `ProtectSystem=strict` makes
+  everything else, `~/.ssh` included, read-only to the daemon.
 - Git: remotes must be https, ssh:// or scp-style and `GIT_ALLOW_PROTOCOL=https:ssh`
   is set, so `ext::` cannot run a shell and `file:` cannot clone from elsewhere on
   the box. The PAT reaches git through `GIT_ASKPASS`, never argv or the remote URL.
@@ -116,6 +121,25 @@ this repository ships (`deploy/`, `manage.py doctor`), or out of reach.
   verification is not implemented: it would need a keyring and a policy per
   project, and a signed hostile commit is still hostile. Review the repo.
 
+### The unlock socket (`src/unlock.py`)
+
+- `/run/hoisty/unlock.sock`, 0600 inside a 0700 `RuntimeDirectory`, created by
+  the daemon and gone when it stops. Two commands: `status` and `unlock`.
+- **Only uid 0.** The file mode alone would admit the service account, and a
+  playbook that has gone bad runs as exactly that, so the peer's credentials are
+  read with `SO_PEERCRED`, which the kernel fills in and a client cannot forge.
+  Every attempt, allowed or refused, is audited.
+- What a caller can do with it: hand over a passphrase, or ask whether the
+  daemon is locked. Nothing reads back out of it, so it is not a path to the key
+  or to the store; the worst a permitted caller can do is supply a wrong
+  passphrase, which is logged.
+- **Residual.** Root can already read the daemon's memory, so a root-only socket
+  grants root nothing it did not have. It exists to keep the *service account*
+  out, and to replace a console prompt that could not be answered on a headless
+  box. The daemon is inert while locked, so an attacker who can stop it can deny
+  service until an operator returns, which is the deliberate cost of keeping
+  nothing on disk.
+
 ### Local host
 
 - **Same uid.** `PR_SET_DUMPABLE=0` blocks ptrace and `/proc/<pid>/mem` from the
@@ -125,15 +149,15 @@ this repository ships (`deploy/`, `manage.py doctor`), or out of reach.
   web process it arrives as a request parameter and is an immutable str until the
   allocator reuses it. What a same-uid process *can* do: read `deploy.db`, write
   to `data/run/` while another deploy is in flight, and, unless the filesystem
-  says otherwise, rewrite `src/`, `venv/` and other projects' checkouts. That is
-  why `deploy/slack-deploy@.service` sets `ProtectSystem=strict` with only `data/`,
+  says otherwise, rewrite the program and other projects' checkouts. That is
+  why `deploy/hoisty@.service` sets `ProtectSystem=strict` with only `data/`,
   `backups/` and the checkouts writable, drop every capability, forbid new
   privileges and namespaces, and filter syscalls; and why `doctor` flags a code
   tree writable by the uid that runs it.
 - **Other uid.** Every file under `data/` and `backups/` is 0600 in a 0700
   directory; `doctor` checks. `deploy.db` is plaintext but holds nothing that is a
   factor on its own: scrypt hashes, TOTP seeds sealed under those passwords, config.
-  Yama `ptrace_scope>=1` (`deploy/sysctl-slack-deploy.conf`) stops cross-process
+  Yama `ptrace_scope>=1` (`deploy/sysctl-hoisty.conf`) stops cross-process
   inspection that `PR_SET_DUMPABLE` does not cover.
 - **Root, the hypervisor, the kernel.** Out of reach. Root reads process memory,
   a hypervisor reads guest RAM, a kernel zero-day is root. The design limits the
@@ -160,7 +184,7 @@ this repository ships (`deploy/`, `manage.py doctor`), or out of reach.
 - `deploy.db`: plaintext by design (the web process must start without a
   passphrase). Contents rated above. Backups seal it.
 - **Backups**: `kdf.json` in the clear plus one AES-256-GCM blob under
-  HMAC-SHA256(store key, "slack-deploy backup"), `kdf.json` as associated data.
+  HMAC-SHA256(store key, "hoisty backup"), `kdf.json` as associated data.
   A stolen backup is noise without the passphrase; a tampered one refuses to
   restore, which closes the path "doctor a backup, get it restored, own a project
   row, wait for the next Slack deploy". There is no unauthenticated backup.
@@ -193,9 +217,11 @@ this repository ships (`deploy/`, `manage.py doctor`), or out of reach.
 ### Supply chain
 
 - **Python packages.** `requirements.txt` pins every package, transitive included,
-  with the sha256 of every published wheel; `make setup` installs with
-  `--require-hashes`, so a package that does not match what was recorded at lock
-  time is refused. This defeats a poisoned mirror, a hijacked later release and a
+  with the sha256 of every published wheel; both `make setup` and the .deb build
+  install with `--require-hashes`, so a package that does not match what was
+  recorded at lock time fails the build rather than shipping. The package vendors
+  that virtualenv, so what runs in production is the set that was reviewed, not
+  whatever a mirror serves on the day. This defeats a poisoned mirror, a hijacked later release and a
   MITM of PyPI. It does not defeat a release that was already hostile when
   locked: review upgrades, run `make lock` deliberately.
 - **The crypto library.** At every start, before any passphrase is read, scrypt,
@@ -222,12 +248,14 @@ sustained TOTP brute force at the capped rate is 120 rows a day under one name.
 
 ## Deployment requirements, in order of consequence
 
-1. The daemon runs as its own uid that owns `data/`, `backups/` and the checkouts
-   and nothing else; `src/`, `venv/` and `manage.py` are root-owned. Use the units
-   in `deploy/`. `doctor` fails until this holds.
+1. Install the .deb and use its unit. It puts the whole install under
+   `/var/lib/hoisty` with `app/` and `venv/` root-owned, gives the service
+   account `data/`, `backups/` and `projects/` and nothing else, and keeps the
+   program read-only to the running daemon. `doctor` fails until this holds, and
+   also runs `dpkg -V hoisty` to report any packaged file that has changed.
 2. The web UI is reached over an SSH forward or with `--tls-cert`; never a plain
    port on a network.
-3. `deploy/sysctl-slack-deploy.conf` applied; swap encrypted or absent; IOMMU on.
+3. `deploy/sysctl-hoisty.conf` applied; swap encrypted or absent; IOMMU on.
 4. Every ansible repo is treated as code that runs on the deploy box, because it
    does: protected branches, review, no untrusted collections.
 5. Passphrase 20+ characters, given at start by a person, held by as few people

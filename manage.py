@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""slack-deploy admin CLI. Run from the checkout: python manage.py <command>."""
+"""hoisty admin CLI. Run from the checkout: python manage.py <command>."""
 import argparse
 import getpass
 import logging
 import os
+import shutil
 import stat
+import subprocess
 import sys
 import termios
 from datetime import datetime
@@ -16,6 +18,7 @@ sys.path.insert(0, str(ROOT / 'src'))
 import db          # noqa: E402
 import runner      # noqa: E402
 import scheduler   # noqa: E402
+import unlock      # noqa: E402
 
 
 def read_secret(prompt):
@@ -69,7 +72,7 @@ def ask_password(*args, **kwargs):
         db.wipe(value)
 
 
-def unlock():
+def unlock_store():
     db.harden_process()
     if not db.KDF_FILE.exists():
         raise SystemExit('not initialised - run: python manage.py init')
@@ -139,7 +142,7 @@ def cmd_migrate(args):
         applied = db.migrate(conn, 'deploy')
     print('deploy.db: ' + (', '.join(applied) if applied else 'up to date'))
     if args.all:
-        store = unlock()
+        store = unlock_store()
         applied = db.migrate(store._conn, 'secrets')
         store.close()
         print('secrets.db: ' + (', '.join(applied) if applied else 'up to date'))
@@ -166,8 +169,10 @@ def cmd_doctor(args):
     if ROOT.stat().st_mode & 0o022:
         problems.append(f'checkout is group/other writable: {ROOT}')
     # a playbook runs as this uid; if this uid can rewrite the code or the venv, one
-    # bad deploy trojans the process that is next handed the global password
-    for path in (ROOT / 'manage.py', ROOT / 'src', ROOT / 'venv'):
+    # bad deploy trojans the process that is next handed the global password.
+    # Do not resolve() the venv: bin/python is a symlink to the system one.
+    venv = Path(sys.executable).parent.parent
+    for path in (ROOT / 'manage.py', ROOT / 'src', venv):
         if path.exists() and os.access(path, os.W_OK):
             problems.append(f'code writable by the uid that runs it (a compromised '
                             f'playbook can trojan it): {path}')
@@ -184,6 +189,7 @@ def cmd_doctor(args):
                 problems.append(f"project {row['name']}: checkout writable by others, "
                                 f"anyone who can edit it receives that project's secrets: {wd}")
     problems += host_posture()
+    problems += package_integrity()
     print(f'running as uid {uid} ({getpass.getuser()}), data dir {db.DATA}')
     print('NOTE: encryption only protects a stolen database file unless this uid is '
           'separate from the accounts people log in as.')
@@ -198,6 +204,20 @@ def _read(path):
         return Path(path).read_text().strip()
     except OSError:
         return None
+
+
+def package_integrity():
+    """On a packaged install, ask dpkg whether anything it shipped has changed.
+    It already records a checksum per file, so this needs no manifest of our own."""
+    if not shutil.which('dpkg') or not Path('/var/lib/dpkg/info/hoisty.md5sums').exists():
+        return []
+    try:
+        out = subprocess.run(['dpkg', '-V', 'hoisty'], capture_output=True, text=True,
+                             timeout=120).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [f'could not verify the installed package: {exc}']
+    return [f'changed since it was installed: {line.split()[-1]}'
+            for line in out.splitlines() if line.strip()]
 
 
 def host_posture():
@@ -226,19 +246,44 @@ def host_posture():
     if _read('/proc/sys/kernel/dmesg_restrict') == '0':
         out.append('kernel.dmesg_restrict=0: kernel addresses and device state readable by '
                    'every user')
-    if not list(Path('/etc/systemd/system').glob('slack-deploy*.service')):
-        out.append('no slack-deploy unit installed: the units in deploy/ make src/, venv/ '
-                   'and the rest of the filesystem read-only to the daemon')
+    units = [u for d in ('/lib/systemd/system', '/usr/lib/systemd/system',
+                         '/etc/systemd/system')
+             for u in Path(d).glob('hoisty*.service') if Path(d).is_dir()]
+    if not units:
+        out.append('no hoisty unit installed: the unit in deploy/ (or the .deb) is '
+                   'what makes app/ and venv/ read-only to the daemon')
     return out
 
 
 def cmd_bot(args):
+    """Starts locked; `hoisty unlock` on the same machine hands it the password."""
     import bot
+    db.harden_process()
+    if not db.KDF_FILE.exists():
+        raise SystemExit('not initialised - run: hoisty init')
     with db.deploy_conn() as conn:
         require_migrated(conn, 'deploy')
-    store = unlock()
-    require_migrated(store._conn, 'secrets')
-    bot.run(store)
+    bot.run()
+
+
+def cmd_unlock(args):
+    """Hand the running daemon the global password. Root only, by its socket."""
+    passphrase = ask_passphrase()
+    try:
+        reply = unlock.ask('unlock', passphrase)
+    except OSError as exc:
+        raise SystemExit(f'cannot reach the daemon on {unlock.SOCKET}: {exc}')
+    finally:
+        db.wipe(passphrase)
+    print(reply)
+    return 0 if reply == 'ok' else 1
+
+
+def cmd_status(args):
+    try:
+        print(unlock.ask('status'))
+    except OSError as exc:
+        raise SystemExit(f'cannot reach the daemon on {unlock.SOCKET}: {exc}')
 
 
 def cmd_web(args):
@@ -285,7 +330,7 @@ def cmd_user_reset_2fa(args):
 
 
 def cmd_secret_set(args):
-    store = unlock()
+    store = unlock_store()
     scope, scope_id = scope_of(args)
     value = db.coerce_value(getpass.getpass(f'Value for {args.name}: '), args.type)
     store.set(scope, scope_id, args.name, value, actor=getpass.getuser(),
@@ -296,7 +341,7 @@ def cmd_secret_set(args):
 
 
 def cmd_secret_list(args):
-    store = unlock()
+    store = unlock_store()
     scope, scope_id = scope_of(args)
     for s in store.names(scope, scope_id):
         print(f"{s['name']:30} {s['type']:8} {s['updated_at']}  "
@@ -307,7 +352,7 @@ def cmd_secret_list(args):
 
 
 def cmd_vars_import(args):
-    store = unlock()
+    store = unlock_store()
     scope, scope_id = scope_of(args)
     names = db.vars_import(store, scope, scope_id, args.path, getpass.getuser())
     db.audit(getpass.getuser(), 'vars-import', f'{scope}/{scope_id} names={names}')
@@ -317,7 +362,7 @@ def cmd_vars_import(args):
 
 
 def cmd_vars_export(args):
-    store = unlock()
+    store = unlock_store()
     scope, scope_id = scope_of(args)
     text = db.vars_export_text(store, scope, scope_id)
     store.close()
@@ -393,7 +438,7 @@ def cmd_project_list(args):
 
 def cmd_cred_set(args):
     """Read an ssh key from a file, or a token from a prompt."""
-    store = unlock()
+    store = unlock_store()
     scope, scope_id = scope_of(args)
     public = None
     if args.path:
@@ -412,7 +457,7 @@ def cmd_cred_set(args):
 
 
 def cmd_cred_gen(args):
-    store = unlock()
+    store = unlock_store()
     scope, scope_id = scope_of(args)
     private, public = db.generate_ssh_key(args.name)
     store.cred_set(scope, scope_id, 'ssh_key', args.name, private, public,
@@ -425,7 +470,7 @@ def cmd_cred_gen(args):
 
 
 def cmd_cred_list(args):
-    store = unlock()
+    store = unlock_store()
     scope = scope_id = None
     if args.project:
         scope, scope_id = scope_of(args)
@@ -442,7 +487,7 @@ def cmd_cred_list(args):
 
 
 def cmd_cred_rm(args):
-    store = unlock()
+    store = unlock_store()
     scope, scope_id = scope_of(args)
     store.cred_delete(scope, scope_id, args.kind)
     db.audit(getpass.getuser(), 'cred-delete', f'{scope}/{scope_id}/{args.kind}')
@@ -452,7 +497,7 @@ def cmd_cred_rm(args):
 
 def cmd_sync(args):
     """Clone the project's ansible repo, or fast-forward it if already there."""
-    store = unlock()
+    store = unlock_store()
     projects = db.projects(args.project)
     if not projects:
         raise SystemExit(f'no such project: {args.project}' if args.project
@@ -482,7 +527,7 @@ def cmd_rekey(args):
 
 
 def cmd_backup(args):
-    store = unlock()
+    store = unlock_store()
     path, pruned = scheduler.backup(store)
     store.close()
     print(f'wrote {path}' + (f', pruned {len(pruned)}' if pruned else ''))
@@ -600,7 +645,9 @@ def main():
     m.add_argument('--all', action='store_true',
                    help='also migrate secrets.db (prompts for the global password)')
     add('doctor', cmd_doctor, help='check ownership, permissions and dependencies')
-    add('bot', cmd_bot, help='run the slack daemon')
+    add('bot', cmd_bot, help='run the slack daemon (starts locked)')
+    add('unlock', cmd_unlock, help='give the running daemon the global password')
+    add('status', cmd_status, help='ask the daemon whether it is locked')
     w = add('web', cmd_web, help='run the web interface')
     w.add_argument('--host', default='127.0.0.1')
     w.add_argument('--port', type=int, default=8080)

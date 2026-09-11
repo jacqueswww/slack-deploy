@@ -21,8 +21,8 @@ from db import Locked, SecretStore, audit, deploy_conn
 logger = logging.getLogger(__name__)
 
 # tunable for ops and tests; defaults are the 2h hard / 5min soft the design calls for
-HARD_SECONDS = int(os.environ.get('SLACK_DEPLOY_HARD_SECONDS', 2 * 3600))
-SOFT_SECONDS = int(os.environ.get('SLACK_DEPLOY_SOFT_SECONDS', 5 * 60))
+HARD_SECONDS = int(os.environ.get('HOISTY_HARD_SECONDS', 2 * 3600))
+SOFT_SECONDS = int(os.environ.get('HOISTY_SOFT_SECONDS', 5 * 60))
 MAX_FAILURES = 5
 LOCKOUT = 300
 MAX_LOCKOUT = 3600
@@ -496,8 +496,8 @@ class Root:
                 st.cred_delete(scope, scope_id, kind)
                 audit(actor(), 'cred-delete', f'{scope}/{scope_id}/{kind}')
             elif generate:
-                private, public = db.generate_ssh_key(name or 'slack-deploy')
-                st.cred_set(scope, scope_id, 'ssh_key', name or 'slack-deploy',
+                private, public = db.generate_ssh_key(name or 'hoisty')
+                st.cred_set(scope, scope_id, 'ssh_key', name or 'hoisty',
                             private, public, actor())
                 audit(actor(), 'cred-generate', f'{scope}/{scope_id}/ssh_key')
             else:
@@ -631,7 +631,7 @@ class Root:
         path, _ = scheduler.backup(store(), day=time.strftime('%Y-%m-%d-%H%M%S'))
         audit(actor(), 'backup-download', path.name)
         return static.serve_file(str(path), 'application/zip', 'attachment',
-                                 f'slack-deploy-{path.name}')
+                                 f'hoisty-{path.name}')
 
     # --- schedules --------------------------------------------------------
     @cherrypy.expose

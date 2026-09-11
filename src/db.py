@@ -18,7 +18,7 @@ import yaml
 from sqlcipher3 import dbapi2 as sqlcipher
 
 ROOT = Path(__file__).resolve().parent.parent
-DATA = Path(os.environ.get('SLACK_DEPLOY_DATA') or ROOT / 'data')
+DATA = Path(os.environ.get('HOISTY_DATA') or ROOT / 'data')
 DEPLOY_DB = DATA / 'deploy.db'
 SECRETS_DB = DATA / 'secrets.db'
 KDF_FILE = DATA / 'kdf.json'
@@ -416,7 +416,7 @@ class _WriteLock:
 
 def backup_key(store_key):
     """A subkey for sealing backups, so the database key itself never leaves SQLCipher."""
-    return hmac.new(bytes(store_key), b'slack-deploy backup', hashlib.sha256).digest()
+    return hmac.new(bytes(store_key), b'hoisty backup', hashlib.sha256).digest()
 
 
 def seal(key, data, aad=b''):
@@ -437,7 +437,7 @@ def unseal(key, blob, aad=b''):
         raise Locked('wrong global password or a tampered backup') from exc
 
 
-def generate_ssh_key(comment='slack-deploy'):
+def generate_ssh_key(comment='hoisty'):
     """New ed25519 keypair. Returns (openssh private, openssh public)."""
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -603,7 +603,7 @@ def totp_verify(secret, code, now=None):
                for drift in range(-TOTP_SKEW, TOTP_SKEW + 1))
 
 
-def totp_uri(secret, username, issuer='slack-deploy'):
+def totp_uri(secret, username, issuer='hoisty'):
     from urllib.parse import quote
     return (f'otpauth://totp/{quote(issuer)}:{quote(username)}?secret={secret}'
             f'&issuer={quote(issuer)}&digits={TOTP_DIGITS}&period={TOTP_STEP}')

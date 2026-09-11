@@ -280,7 +280,7 @@ def _git_env(pat):
     env['GIT_TERMINAL_PROMPT'] = '0'      # never hang a daemon on a prompt
     env['GIT_ALLOW_PROTOCOL'] = 'https:ssh'   # no ext::, fd::, file or git://
     if pat:
-        env['SLACK_DEPLOY_GIT_PAT'] = pat
+        env['HOISTY_GIT_PAT'] = pat
         env['GIT_ASKPASS'] = str(ASKPASS)
     return env
 

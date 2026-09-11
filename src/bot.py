@@ -1,6 +1,7 @@
 """Slack socket-mode daemon. Reads everything from the encrypted store."""
 import logging
 import shlex
+import threading
 
 from slack_sdk import WebClient
 from slack_sdk.socket_mode import SocketModeClient
@@ -9,6 +10,7 @@ from slack_sdk.socket_mode.response import SocketModeResponse
 import db
 import runner
 import scheduler
+import unlock
 from db import GLOBAL_SCOPE, audit, deploy_conn
 
 logger = logging.getLogger(__name__)
@@ -110,17 +112,35 @@ def process(store):
     return listener
 
 
-def run(store):
+def run(allow_uids=unlock.ROOT_ONLY):
+    """Start locked and inert, then serve once someone unlocks.
+
+    There is nothing to do before that: the Slack tokens are themselves in the
+    encrypted store, so a locked daemon cannot even connect. That is what makes a
+    console prompt unnecessary - systemd brings the unit up at boot and it waits
+    here until an administrator runs `hoisty unlock`."""
+    runner.reap_running()
+    gate = unlock.Gate()
+    unlock.serve(gate, allow_uids=allow_uids)
+    unlock.sd_notify('READY=1\nSTATUS=locked - waiting for: hoisty unlock')
+    logger.info('locked - waiting for: hoisty unlock (%s)', unlock.SOCKET)
+    gate.ready.wait()
+    serve(gate.store)
+
+
+def serve(store):
+    """Everything the daemon does, once it holds the key."""
+    if db.pending(store._conn, 'secrets'):
+        raise SystemExit('secrets.db has pending migrations - run: hoisty migrate --all')
     app_token = store.get(GLOBAL_SCOPE, 0, 'slack_app_token')
     bot_token = store.get(GLOBAL_SCOPE, 0, 'slack_bot_token')
     if not app_token or not bot_token:
         raise SystemExit('slack_app_token / slack_bot_token not set in the store '
-                         '(manage.py secret-set global slack_bot_token)')
-    runner.reap_running()
+                         '(hoisty secret-set slack_bot_token)')
     scheduler.start(store)
     client = SocketModeClient(app_token=app_token, web_client=WebClient(token=bot_token))
     client.socket_mode_request_listeners.append(process(store))
     client.connect()
-    logger.info('slack-deploy connected')
-    import threading
+    logger.info('hoisty connected')
+    unlock.sd_notify('STATUS=connected to Slack')
     threading.Event().wait()

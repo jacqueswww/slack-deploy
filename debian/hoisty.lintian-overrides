@@ -1,0 +1,13 @@
+# The virtualenv is vendored on purpose: requirements.txt records a sha256 for
+# every wheel and the build installs with --require-hashes, so the package is a
+# reproducible, pinned set rather than whatever the distro ships today. That is
+# the supply-chain property this tool is built around.
+hoisty: embedded-library
+hoisty: python-package-missing-dependency-for-lib
+hoisty: unstripped-binary-or-object
+hoisty: extra-license-file
+# Program files under /var/lib is off-FHS. It is deliberate: the whole install,
+# code and data, is one directory an operator can reason about, and the unit
+# keeps app/ and venv/ read-only to the service account regardless.
+hoisty: dir-or-file-in-var-lib
+hoisty: file-in-unusual-dir

@@ -1,10 +1,10 @@
-# slack-deploy. Run `make` for the list.
+# hoisty. Run `make` for the list.
 PY    := venv/bin/python
 HOST  ?= 127.0.0.1
 PORT  ?= 8080
 STAMP := venv/.installed
 
-.PHONY: help setup init doctor bot web test backup migrate rekey clean lock
+.PHONY: help setup init doctor bot web test backup migrate rekey clean lock deb
 
 help:
 	@grep -hE '^[a-z-]+:.*##' $(MAKEFILE_LIST) | sed 's/:.*##/\t/' | expand -t18
@@ -45,6 +45,9 @@ test: setup  ## run every test file (T=variables to run just one)
 
 clean:  ## remove ./venv (leaves data/ alone)
 	rm -rf venv
+
+deb:  ## build the .deb (vendors the venv; needs network and dpkg-dev)
+	dpkg-buildpackage -us -uc -b
 
 lock:  ## regenerate requirements.txt (pins + sha256 of every wheel) from requirements.in
 	python3 -m venv .lock-venv && .lock-venv/bin/pip install --quiet pip-tools

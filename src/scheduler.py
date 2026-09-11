@@ -92,7 +92,7 @@ def open_backup(zip_path, passphrase):
     backup taken while a rekey was mid-flight."""
     with zipfile.ZipFile(zip_path) as zf:
         if sorted(zf.namelist()) != sorted([KDF_FILE.name, SEALED]):
-            raise ValueError(f'{zip_path} is not a slack-deploy backup')
+            raise ValueError(f'{zip_path} is not a hoisty backup')
         kdf, blob = zf.read(KDF_FILE.name), zf.read(SEALED)
     cfg = json.loads(kdf)
     error = None

@@ -1,0 +1,57 @@
+#!/usr/bin/make -f
+export DH_VERBOSE = 1
+# no pybuild: the venv is vendored wholesale, not built as a distro python module
+export PYBUILD_DISABLE = 1
+
+D := debian/hoisty
+P := $(D)/var/lib/hoisty
+VENV := /var/lib/hoisty/venv
+
+%:
+	dh $@
+
+override_dh_auto_clean:
+override_dh_auto_build:
+# the suite needs a writable HOME and a throwaway data dir; it is run in CI on
+# the source tree, so packaging does not run it again
+override_dh_auto_test:
+
+override_dh_auto_install:
+	install -d -m 0755 $(P)/app
+	cp -a src migrations manage.py requirements.txt README.md THREAT-MODEL.md $(P)/app/
+	find $(P)/app -name '__pycache__' -prune -exec rm -rf {} +
+	install -D -m 0755 debian/hoisty.wrapper $(D)/usr/bin/hoisty
+	install -D -m 0644 deploy/hoisty@.service $(D)/lib/systemd/system/hoisty@.service
+	install -D -m 0644 deploy/sysctl-hoisty.conf $(D)/usr/lib/sysctl.d/60-hoisty.conf
+	# Vendored virtualenv. --require-hashes means every wheel must match the
+	# sha256 recorded in requirements.txt, so a poisoned mirror or a hijacked
+	# release fails the build instead of shipping. Needs network at build time.
+	python3 -m venv --copies $(P)/venv
+	$(P)/venv/bin/pip install --quiet --upgrade pip
+	$(P)/venv/bin/pip install --quiet --require-hashes -r requirements.txt
+	# The venv was built inside the build root, so its scripts point there. The
+	# build root is a prefix of the final path, so stripping it yields exactly
+	# the installed path - and that catches every form, not just the shebang:
+	# pip emits a /bin/sh exec-wrapper instead of a shebang when the build path
+	# is long, and the activate scripts carry the path too. -I skips the copied
+	# python binary and anything else non-text.
+	grep -rlI -- '$(CURDIR)/$(D)' $(P)/venv \
+	    | xargs -r sed -i 's|$(CURDIR)/$(D)||g'
+	test ! -s "$$(grep -rlI -- '$(CURDIR)' $(P)/venv | head -1)" \
+	    || { echo 'build-root path left in the venv'; exit 1; }
+	find $(P)/venv -name '__pycache__' -prune -exec rm -rf {} +
+	find $(P)/venv -name '*.pyc' -delete
+	# nothing under app/ or venv/ may be writable by anyone but root
+	chmod -R go-w $(P)/app $(P)/venv
+
+# the template unit cannot be enabled as-is; instances are enabled by the admin
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start --name=hoisty@
+
+# all of these trip over the vendored venv and have nothing useful to do with it
+override_dh_python3:
+override_dh_shlibdeps:
+override_dh_strip:
+override_dh_strip_nondeterminism:
+override_dh_dwz:
+override_dh_makeshlibs:
