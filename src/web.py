@@ -1,4 +1,4 @@
-"""CherryPy UI. Login -> 2FA -> global password. 5min soft lock, 2h hard logout."""
+"""CherryPy UI. Login -> 2FA -> global password. 10min soft lock, 2h hard logout."""
 import ipaddress
 import json
 import logging
@@ -20,9 +20,9 @@ from db import Locked, SecretStore, audit, deploy_conn
 
 logger = logging.getLogger(__name__)
 
-# tunable for ops and tests; defaults are the 2h hard / 5min soft the design calls for
+# tunable for ops and tests; defaults are the 2h hard / 10min soft the design calls for
 HARD_SECONDS = int(os.environ.get('HOISTY_HARD_SECONDS', 2 * 3600))
-SOFT_SECONDS = int(os.environ.get('HOISTY_SOFT_SECONDS', 5 * 60))
+SOFT_SECONDS = int(os.environ.get('HOISTY_SOFT_SECONDS', 10 * 60))
 MAX_FAILURES = 5
 LOCKOUT = 300
 MAX_LOCKOUT = 3600
@@ -359,7 +359,7 @@ class Root:
 
     @cherrypy.expose
     def relock(self, code=None, ajax=None, csrf=None):
-        """Soft lock: 5 minutes idle, reopened with a 2FA code only."""
+        """Soft lock: 10 minutes idle, reopened with a 2FA code only."""
         if cherrypy.request.method != 'POST':
             return render('auth.html', stage='relock', expired=None, error=None)
         user = _row('SELECT * FROM user WHERE id=?', (cherrypy.session['user_id'],))

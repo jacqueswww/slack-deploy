@@ -50,7 +50,7 @@ this repository ships (`deploy/`, `manage.py doctor`), or out of reach.
 - **Authentication.** Password (scrypt) then TOTP then the global passphrase.
   Unknown usernames cost a scrypt too. Lockouts per factor double from 5 minutes
   to an hour until a success; every lockout is a WARNING in the log. Sessions: 2 h
-  hard cap, 5 min idle relock on a TOTP code, RAM only, regenerated at login.
+  hard cap, 10 min idle relock on a TOTP code, RAM only, regenerated at login.
 - **Authorisation.** Every request re-reads the user row: disable, delete and
   demote bite on the next request. Admin-only: config, users, secrets, reveal,
   export, backup. Reveal is POST-only and audited.
@@ -64,7 +64,7 @@ this repository ships (`deploy/`, `manage.py doctor`), or out of reach.
   therefore keep legitimate users locked out. Accepted: reaching the port at all
   requires a foothold, and the audit log shows it.
 - **Residual.** A compromised admin *browser* with a live unlocked session has the
-  admin's powers for up to 5 minutes idle / 2 hours total. A zero-day in CherryPy,
+  admin's powers for up to 10 minutes idle / 2 hours total. A zero-day in CherryPy,
   Jinja or Python is not mitigated by anything but the CSP, the pinned versions
   and the systemd sandbox.
 

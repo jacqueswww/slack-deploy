@@ -43,7 +43,7 @@ token held in an encrypted store that only a human-typed passphrase can open.
 - The daemons start locked and hold nothing. The passphrase reaches them over a
   root-only unix socket (`hoisty unlock`), never a tty, a file or a command line,
   so a stolen disk image yields nothing and a reboot needs a human. The web
-  process holds a key only inside a session: 2 hour hard limit, 5 minute idle
+  process holds a key only inside a session: 2 hour hard limit, 10 minute idle
   relock on a 2FA code.
 - Web login is password, then TOTP, then the passphrase. Lockouts per factor
   escalate from 5 minutes to 1 hour. Plain HTTP is refused off loopback.
