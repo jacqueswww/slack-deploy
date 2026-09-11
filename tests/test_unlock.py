@@ -66,6 +66,41 @@ def the_right_password_unlocks_the_daemon():
         'error: already unlocked', 'a second unlock must not replace the key'
 
 
+def a_store_the_daemon_cannot_use_is_refused_at_the_prompt():
+    """The bot needs its Slack tokens. Accepting the password and then dying
+    where only the journal sees it is how `hoisty unlock` returned an empty
+    string; the reason belongs at the operator's prompt, still locked."""
+    import bot
+    path = db.DATA.parent / 'run' / 'checked.sock'
+    gate = unlock.Gate(check=bot.startup_problem)
+    unlock.serve(gate, path, allow_uids=(os.getuid(),))
+    reply = unlock.ask('unlock', bytearray(GOOD.encode()), path=path)
+    assert 'slack_app_token' in reply and reply.startswith('error:'), reply
+    assert gate.store is None and not gate.ready.is_set(), 'it must stay locked'
+    assert unlock.ask('status', path=path) == 'locked'
+
+    store = db.SecretStore.unlock(GOOD)
+    store.set(db.GLOBAL_SCOPE, 0, 'slack_app_token', 'xapp-test')
+    store.set(db.GLOBAL_SCOPE, 0, 'slack_bot_token', 'xoxb-test')
+    store.close()
+    assert unlock.ask('unlock', bytearray(GOOD.encode()), path=path) == 'ok'
+    assert gate.ready.wait(5) and gate.store is not None
+
+
+def the_reply_is_sent_before_the_daemon_is_released():
+    """A daemon that exits on the way up must not take the socket thread with
+    it before the client has heard anything."""
+    path = db.DATA.parent / 'run' / 'ordered.sock'
+    seen = []
+    gate = unlock.Gate()
+    real_set = gate.ready.set
+    gate.ready.set = lambda: (seen.append('released'), real_set())
+    unlock.serve(gate, path, allow_uids=(os.getuid(),))
+    reply = unlock.ask('unlock', bytearray(GOOD.encode()), path=path)
+    assert reply == 'ok', reply
+    assert seen == ['released'], 'ready must be set, and only after the reply'
+
+
 def every_attempt_is_audited():
     with db.deploy_conn() as conn:
         actions = [r['action'] for r in conn.execute(
@@ -129,7 +164,9 @@ if __name__ == '__main__':
     sys.exit(harness.run(
         a_fresh_daemon_is_locked, only_root_may_drive_it_in_production,
         a_wrong_password_leaves_it_locked, rubbish_is_refused_without_touching_the_gate,
-        the_right_password_unlocks_the_daemon, every_attempt_is_audited,
+        the_right_password_unlocks_the_daemon,
+        a_store_the_daemon_cannot_use_is_refused_at_the_prompt,
+        the_reply_is_sent_before_the_daemon_is_released, every_attempt_is_audited,
         the_passphrase_is_wiped_after_it_is_sent, the_cli_talks_to_the_module_not_a_shadow,
         the_cli_exits_non_zero_when_the_socket_refuses,
         a_missing_daemon_is_an_error_not_a_traceback, sd_notify_is_a_no_op_off_systemd))

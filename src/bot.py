@@ -120,7 +120,7 @@ def run():
     console prompt unnecessary - systemd brings the unit up at boot and it waits
     here until an administrator runs `hoisty unlock`."""
     runner.reap_running()
-    gate = unlock.Gate()
+    gate = unlock.Gate(check=startup_problem)
     unlock.serve(gate)
     unlock.sd_notify('READY=1\nSTATUS=locked - waiting for: hoisty unlock')
     logger.info('locked - waiting for: hoisty unlock (%s)', unlock.SOCKET)
@@ -128,15 +128,22 @@ def run():
     serve(gate.store)
 
 
+def startup_problem(store):
+    """Why this store cannot run the daemon, or None. Checked while the operator
+    is still on the unlock socket, so they read it at their own prompt."""
+    if db.pending(store._conn, 'secrets'):
+        return 'secrets.db has pending migrations - run: hoisty migrate --all'
+    if not (store.get(GLOBAL_SCOPE, 0, 'slack_app_token')
+            and store.get(GLOBAL_SCOPE, 0, 'slack_bot_token')):
+        return ('slack_app_token / slack_bot_token not set in the store '
+                '(hoisty secret-set slack_bot_token)')
+    return None
+
+
 def serve(store):
     """Everything the daemon does, once it holds the key."""
-    if db.pending(store._conn, 'secrets'):
-        raise SystemExit('secrets.db has pending migrations - run: hoisty migrate --all')
     app_token = store.get(GLOBAL_SCOPE, 0, 'slack_app_token')
     bot_token = store.get(GLOBAL_SCOPE, 0, 'slack_bot_token')
-    if not app_token or not bot_token:
-        raise SystemExit('slack_app_token / slack_bot_token not set in the store '
-                         '(hoisty secret-set slack_bot_token)')
     scheduler.start(store)
     client = SocketModeClient(app_token=app_token, web_client=WebClient(token=bot_token))
     client.socket_mode_request_listeners.append(process(store))

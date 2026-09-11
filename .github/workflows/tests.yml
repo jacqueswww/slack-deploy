@@ -93,5 +93,15 @@ jobs:
           test "$(sudo hoisty status)" = "locked"
           # only root may drive the unlock socket
           ! sudo -u hoisty hoisty status
-          printf 'a shared passphrase long enough\n' | sudo hoisty unlock
-          test "$(sudo hoisty status)" = "unlocked"
+          # No Slack tokens are set here, so the daemon cannot run. It must say
+          # so at the prompt and stay locked, rather than take the password and
+          # then die where only the journal would see it.
+          printf 'a shared passphrase long enough\n' | sudo hoisty unlock \
+            | tee /tmp/unlock.out || true
+          grep -q slack_app_token /tmp/unlock.out
+          test "$(sudo hoisty status)" = "locked"
+          systemctl is-active hoisty@bot
+          # a wrong password is refused without disturbing any of that
+          printf 'not the right passphrase at all\n' | sudo hoisty unlock \
+            | grep -q 'incorrect global password' || true
+          test "$(sudo hoisty status)" = "locked"

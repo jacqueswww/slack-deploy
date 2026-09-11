@@ -44,10 +44,18 @@ def sd_notify(state):
 
 
 class Gate:
-    """Holds the store once someone unlocks it; the daemon waits on `ready`."""
+    """Holds the store once someone unlocks it; the daemon waits on `ready`.
 
-    def __init__(self):
+    `check` is whatever the daemon needs to be true of the store before it can
+    work - pending migrations, missing tokens. It runs while the caller is still
+    on the socket, so the operator reads the reason at their prompt instead of
+    the daemon accepting the password and then dying where only the journal
+    sees it. A store that fails the check is closed and the gate stays locked.
+    """
+
+    def __init__(self, check=None):
         self._lock = threading.Lock()
+        self._check = check
         self.store = None
         self.ready = threading.Event()
 
@@ -58,10 +66,14 @@ class Gate:
             if self.store is not None:
                 return 'already unlocked'
             try:
-                self.store = db.SecretStore.unlock(passphrase)
+                store = db.SecretStore.unlock(passphrase)
             except db.Locked:
                 return 'incorrect global password'
-            self.ready.set()
+            problem = self._check(store) if self._check else None
+            if problem:
+                store.close()
+                return problem
+            self.store = store
             return None
 
 
@@ -111,7 +123,11 @@ def _serve_one(conn, gate, allow_uids):
     db.audit(f'uid {uid}', 'unlock')
     logger.info('unlocked by uid %s', uid)
     sd_notify('STATUS=unlocked')
+    # Reply first, release the daemon second. The other way round, a daemon
+    # that exits on the way up takes this thread with it before the client has
+    # heard anything, and `hoisty unlock` returns an empty string.
     conn.sendall(b'ok\n')
+    gate.ready.set()
 
 
 def serve(gate, path=None, allow_uids=ROOT_ONLY):
