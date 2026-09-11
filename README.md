@@ -31,7 +31,7 @@ token held in an encrypted store that only a human-typed passphrase can open.
 - **Export.** A scope's variables download as YAML, or render into a readonly
   textarea on the page when you just want to copy and paste them.
 - **Retention.** A `prune` schedule drops job rows and backup zips older than 90
-  days, and one job's log is capped when written, so a noisy play cannot bloat
+  days, and one job's log is capped at 1MB when written, so a noisy play cannot bloat
   the database. Projects, hosts, secrets and users are never touched by age.
 - **Audit.** Every login, failure, unlock, reveal, export, config change and
   deploy is recorded in the database and in the process log. An export shown on

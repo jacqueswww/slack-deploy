@@ -22,7 +22,7 @@ LOG_TAIL = 2000
 # What one job may keep in the database. Retention clears old rows, but a single
 # noisy play can run to megabytes today, so the tail is kept and the middle
 # dropped: a failure shows up at the end, not in the thousandth ok= line.
-MAX_LOG = 256 * 1024
+MAX_LOG = 1024 * 1024
 _running = set()
 _running_lock = threading.Lock()
 _live = set()      # secret files and dirs to remove however the process ends
