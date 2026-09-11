@@ -15,6 +15,7 @@ from harness import GOOD, BAD
 
 import db
 import web
+from web import Root
 
 PASSWORD = 'correct horse battery'
 CTX = {}
@@ -136,6 +137,43 @@ def nothing_destructive_submits_without_asking():
     layout = (templates / 'layout.html').read_text()
     assert "data-confirm" in layout and 'closest' in layout, \
         'the delegated confirm handler must still be in the page'
+
+
+def every_form_field_is_one_its_handler_accepts():
+    """A form that posts a field its handler has no parameter for is a 400 with
+    no useful message, which is exactly what adding skip_tags to the environment
+    form produced. Walk the templates and check the signatures."""
+    import inspect
+    import re
+    from pathlib import Path
+    templates = Path(__file__).resolve().parent.parent / 'src' / 'templates'
+    problems = []
+    for page in sorted(templates.glob('*.html')):
+        text = page.read_text()
+        for form in re.findall(r'<form\b.*?</form>', text, re.S):
+            default = re.search(r'<form\b[^>]*\baction="([^"]+)"', form).group(1)
+            # a field is sent whatever is clicked; a named button is sent only
+            # when it is the one clicked, and then to its own formaction
+            named_buttons = re.findall(r'<button\b[^>]*>', form)
+            fields = set(re.findall(
+                r'<(?:input|select|textarea)[^>]*\bname="([^"]+)"', form))
+            targets = {default: set(fields)}
+            for button in named_buttons:
+                name = re.search(r'\bname="([^"]+)"', button)
+                action = re.search(r'\bformaction="([^"]+)"', button)
+                where = action.group(1) if action else default
+                targets.setdefault(where, set(fields))
+                if name:
+                    targets[where].add(name.group(1))
+            for action, fields in targets.items():
+                handler = getattr(Root, action.strip('/').replace('-', '_'), None)
+                if handler is None:
+                    problems.append(f'{page.name}: no handler for {action}')
+                    continue
+                accepted = set(inspect.signature(handler).parameters) - {'self'}
+                for field in fields - accepted:
+                    problems.append(f'{page.name}: {action} has no parameter {field!r}')
+    assert not problems, 'form/handler mismatch: ' + '; '.join(sorted(set(problems)))
 
 
 def plain_http_off_loopback_is_refused():
@@ -445,6 +483,7 @@ if __name__ == '__main__':
     code = harness.run(
         anonymous_is_sent_to_login, a_real_browser_can_actually_log_in,
         nothing_destructive_submits_without_asking,
+        every_form_field_is_one_its_handler_accepts,
         plain_http_off_loopback_is_refused,
         unknown_users_cost_the_same_as_wrong_passwords, lockouts_escalate_until_a_success,
         wrong_passwords_are_throttled,
