@@ -30,6 +30,8 @@ _live = set()      # secret files and dirs to remove however the process ends
 VENV_BIN = str(Path(sys.executable).parent)   # do not resolve(): venv/bin/python is a symlink
 ANSIBLE_PLAYBOOK = str(Path(VENV_BIN) / 'ansible-playbook')
 GIT = '/usr/bin/git'
+SSH = '/usr/bin/ssh'
+SSH_TEST_TIMEOUT = 20
 DEPLOY_TIMEOUT = 6 * 3600
 # fullmatch everywhere: `$` also matches before a trailing newline
 SAFE_TAGS = re.compile(r'[A-Za-z0-9_,.:-]+')
@@ -213,6 +215,7 @@ def _ansible_env(env, known_hosts=None):
 def write_inventory(workdir, hosts):
     """INI inventory from validated host rows: a line per host, a section per group."""
     lines = [h['name'] + (f" ansible_host={h['address']}" if h['address'] else '')
+             + (f" ansible_user={h['ssh_user']}" if h['ssh_user'] else '')
              for h in hosts]
     groups = {}
     for h in hosts:
@@ -234,6 +237,34 @@ def write_known_hosts(workdir, hosts):
     path = os.path.join(workdir, 'known_hosts')
     Path(path).write_text('\n'.join(lines) + '\n')
     return path
+
+
+def test_host(project, host, store):
+    """Log in and run true: same key, same pin, same strictness as a deploy would
+    use, so a pass here means a deploy reaches the box. (rc, output)."""
+    ssh = store.cred_resolve('ssh_key', project['id'])
+    key_path = workdir = None
+    try:
+        workdir = tempfile.mkdtemp(dir=str(RUN_DIR))
+        _live.add(workdir)
+        known = write_known_hosts(workdir, [host])
+        files = ' '.join(filter(None, (known, '~/.ssh/known_hosts')))
+        argv = [SSH, '-n', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
+                '-o', f'UserKnownHostsFile={files}',
+                '-o', f'ConnectTimeout={SSH_TEST_TIMEOUT}']
+        if ssh:
+            key_path = write_secret_file(ssh['secret'], '.key')
+            argv += ['-i', key_path, '-o', 'IdentitiesOnly=yes']
+        if host['ssh_user']:
+            argv += ['-l', host['ssh_user']]
+        argv += ['--', host['address'] or host['name'], 'true']
+        code, out = _run(argv, None, [ssh['secret']] if ssh else (),
+                         timeout=SSH_TEST_TIMEOUT + 10)
+    finally:
+        for path in (key_path, workdir):
+            if path:
+                _remove(path)
+    return code, out.strip()
 
 
 def _start_job(kind, project_id, environment_id, actor):

@@ -407,12 +407,16 @@ class Root:
     # --- projects ---------------------------------------------------------
     @cherrypy.expose
     def project(self, id=None, name=None, working_dir=None, branch='master',
-                git_remote=None, delete=None, csrf=None):
+                git_remote=None, cloud_user='root', delete=None, csrf=None):
         if cherrypy.request.method != 'POST':
+            # straight into the cloud-init preview, so keep it to a login name
+            if not db.HOST_NAME.fullmatch(cloud_user or '') or cloud_user.startswith('-'):
+                raise cherrypy.HTTPError(400, 'login user may only contain letters, digits, . _ -')
             return render('project.html',
                           project=_row('SELECT * FROM project WHERE id=?', (id,))
                           if id else None, hosts=db.hosts(id) if id else [],
-                          deploy_key=_deploy_key(id) if id else None)
+                          deploy_key=_deploy_key(id) if id else None,
+                          cloud_user=cloud_user)
         require_admin()
         if not delete:
             try:
@@ -438,7 +442,7 @@ class Root:
     # --- hosts ------------------------------------------------------------
     @cherrypy.expose
     def host(self, project_id=None, name=None, address=None, groups=None,
-             ssh_host_key=None, delete=None, csrf=None):
+             ssh_host_key=None, ssh_user=None, delete=None, csrf=None):
         if cherrypy.request.method != 'POST':
             raise cherrypy.HTTPError(405)
         require_admin()
@@ -449,12 +453,27 @@ class Root:
             audit(actor(), 'host-delete', f"project={project['id']} name={name}")
         else:
             try:
-                name, key = db.host_set(project['id'], name, address, groups, ssh_host_key)
+                name, key = db.host_set(project['id'], name, address, groups,
+                                        ssh_host_key, ssh_user)
             except ValueError as exc:
                 raise cherrypy.HTTPError(400, str(exc))
             audit(actor(), 'host-set', f"project={project['id']} name={name} "
                                        f"pinned={bool(key)}")
         raise cherrypy.HTTPRedirect(f"/project?id={project['id']}")
+
+    @cherrypy.expose
+    def host_test(self, project_id=None, name=None, csrf=None):
+        """Does the deploy key actually get in? Runs true over ssh, nothing more."""
+        if cherrypy.request.method != 'POST':
+            raise cherrypy.HTTPError(405)
+        project = _row('SELECT * FROM project WHERE id=?', (project_id,))
+        host = _row('SELECT * FROM host WHERE project_id=? AND name=?',
+                    (project['id'], name))
+        code, out = runner.test_host(project, host, store())
+        audit(actor(), 'host-test', f"project={project['id']} name={name} rc={code}")
+        return render('project.html', project=project, hosts=db.hosts(project['id']),
+                      deploy_key=_deploy_key(project['id']), cloud_user='root',
+                      test={'name': name, 'ok': code == 0, 'out': out or f'exit {code}'})
 
     # --- environments -----------------------------------------------------
     @cherrypy.expose

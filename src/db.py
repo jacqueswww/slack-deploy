@@ -637,16 +637,19 @@ HOST_KEY_TYPES = ('ssh-ed25519', 'ssh-rsa', 'ecdsa-sha2-nistp256',
                   'ecdsa-sha2-nistp384', 'ecdsa-sha2-nistp521')
 
 
-def check_host(name, address=None, groups=None, ssh_host_key=None):
-    """(name, address, groups, key), each a strict token: every one becomes part
-    of a generated inventory or known_hosts line."""
+def check_host(name, address=None, groups=None, ssh_host_key=None, ssh_user=None):
+    """(name, address, groups, key, user), each a strict token: every one becomes
+    part of a generated inventory or known_hosts line."""
     if not HOST_NAME.fullmatch(name or ''):
         raise ValueError('host name may only contain letters, digits, . _ -')
     address = (address or '').strip() or None
     if address and not HOST_ADDRESS.fullmatch(address):
         raise ValueError('address must be a hostname or IP')
-    # both reach ssh as the destination argument, where a leading dash is an option
-    for field, value in (('name', name), ('address', address)):
+    user = (ssh_user or '').strip() or None
+    if user and not HOST_NAME.fullmatch(user):
+        raise ValueError('login user may only contain letters, digits, . _ -')
+    # all three reach ssh as an argument, where a leading dash is an option
+    for field, value in (('name', name), ('address', address), ('user', user)):
         if value and value.startswith('-'):
             raise ValueError(f'host {field} may not start with "-": {value}')
     names = [g for g in (groups or '').replace(' ', '').split(',') if g]
@@ -661,7 +664,7 @@ def check_host(name, address=None, groups=None, ssh_host_key=None):
             valid = False
         if not valid:
             raise ValueError('ssh host key must be "<type> <base64>" as ssh-keyscan prints it')
-    return name, address, ','.join(names) or None, key
+    return name, address, ','.join(names) or None, key, user
 
 
 def fingerprint(ssh_host_key):
@@ -679,19 +682,21 @@ def hosts(project_id):
     return rows
 
 
-def host_set(project_id, name, address=None, groups=None, ssh_host_key=None):
+def host_set(project_id, name, address=None, groups=None, ssh_host_key=None,
+             ssh_user=None):
     """A key of None keeps whatever is pinned: the web form's key box is always
     empty, so overwriting would silently unpin the host on any other edit. Remove
     a pin by deleting the host and adding it again."""
-    name, address, groups, key = check_host(name, address, groups, ssh_host_key)
+    name, address, groups, key, user = check_host(name, address, groups,
+                                                  ssh_host_key, ssh_user)
     with deploy_conn() as conn:
         conn.execute(
-            'INSERT INTO host (project_id, name, address, groups, ssh_host_key) '
-            'VALUES (?,?,?,?,?) ON CONFLICT(project_id, name) DO UPDATE SET '
+            'INSERT INTO host (project_id, name, address, groups, ssh_host_key, '
+            'ssh_user) VALUES (?,?,?,?,?,?) ON CONFLICT(project_id, name) DO UPDATE SET '
             'address=excluded.address, groups=excluded.groups, '
             'ssh_host_key=coalesce(excluded.ssh_host_key, host.ssh_host_key), '
-            "updated_at=datetime('now')",
-            (project_id, name, address, groups, key))
+            "ssh_user=excluded.ssh_user, updated_at=datetime('now')",
+            (project_id, name, address, groups, key, user))
         if key is None:
             key = conn.execute('SELECT ssh_host_key FROM host WHERE project_id=? AND '
                                'name=?', (project_id, name)).fetchone()[0]

@@ -274,7 +274,7 @@ def project_hosts_become_the_inventory():
         pass
     _, public = db.generate_ssh_key('host')
     pinned = public.rsplit(' ', 1)[0]
-    db.host_set(pid, 'box', '127.0.0.1', 'local')
+    db.host_set(pid, 'box', '127.0.0.1', 'local', None, 'ubuntu')
     db.host_set(pid, 'db1.example', None, 'db, web', pinned + ' a comment')
     for bad in (('a b',), ('ok', 'x\n[evil]'), ('ok', None, 'g;h'), ('ok', None, None, 'rubbish'),
                 ('ok', None, None, 'ssh-ed25519 !!!'), ('ok', None, None, 'ssh-dss AAAA')):
@@ -290,7 +290,7 @@ def project_hosts_become_the_inventory():
     workdir = tempfile.mkdtemp(dir=str(db.RUN_DIR))
     try:
         inv = Path(runner.write_inventory(workdir, rows)).read_text()
-        assert inv == ('box ansible_host=127.0.0.1\ndb1.example\n'
+        assert inv == ('box ansible_host=127.0.0.1 ansible_user=ubuntu\ndb1.example\n'
                        '[db]\ndb1.example\n[local]\nbox\n[web]\ndb1.example\n'), inv
         known = runner.write_known_hosts(workdir, rows)
         assert Path(known).read_text() == f'db1.example {pinned}\n'
@@ -426,6 +426,38 @@ def a_second_deploy_is_refused_while_one_runs():
         runner._release({f"env:{CTX['eid']}"})
 
 
+def a_host_login_test_uses_the_key_and_the_pin():
+    """The test button must log in the way a deploy does: the project's key, the
+    host's user, the pin - never trust on first use - and leave no key file."""
+    with db.deploy_conn() as conn:
+        pid = conn.execute("INSERT INTO project (name, working_dir, branch) "
+                           "VALUES ('tester',?,'main')",
+                           (str(WORK / 'checkout'),)).lastrowid
+        project = dict(conn.execute('SELECT * FROM project WHERE id=?', (pid,)).fetchone())
+    STORE.cred_set('project', pid, 'ssh_key', 'box-key', *db.generate_ssh_key('box'))
+    db.host_set(pid, 'box', '127.0.0.1', None, None, 'ubuntu')
+    host = db.hosts(pid)[0]
+    seen = {}
+
+    def fake(argv, cwd, secret_values=(), env=None, timeout=None):
+        seen['argv'] = argv
+        return 255, 'Permission denied (publickey).'
+
+    real, runner._run = runner._run, fake
+    try:
+        code, out = runner.test_host(project, host, STORE)
+    finally:
+        runner._run = real
+    argv = seen['argv']
+    assert (code, out) == (255, 'Permission denied (publickey).')
+    assert argv[0] == runner.SSH and argv[-3:] == ['--', '127.0.0.1', 'true'], argv
+    assert argv[argv.index('-l') + 1] == 'ubuntu', argv
+    for option in ('BatchMode=yes', 'StrictHostKeyChecking=yes'):
+        assert option in argv, f'{option} missing: {argv}'
+    key = argv[argv.index('-i') + 1]
+    assert not Path(key).exists(), 'the private key file must be gone'
+
+
 if __name__ == '__main__':
     sys.exit(harness.run(
         argv_is_built_from_structured_fields, stored_fields_cannot_become_raw_argv,
@@ -438,4 +470,5 @@ if __name__ == '__main__':
         host_fields_cannot_reach_ssh_as_options_or_extra_lines,
         host_key_checking_does_not_depend_on_pinning_state,
         a_timed_out_run_kills_the_whole_tree,
-        a_failure_before_the_run_releases_the_claim, a_restart_marks_running_jobs_lost))
+        a_failure_before_the_run_releases_the_claim, a_restart_marks_running_jobs_lost,
+        a_host_login_test_uses_the_key_and_the_pin))

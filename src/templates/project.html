@@ -71,24 +71,59 @@ the daemon user's own ssh key.</span></p>
   >Remove this project's key</button></form>{% endif %}
 </fieldset>{% endif %}
 
+{% if deploy_key and deploy_key.public %}
+<h2>New server</h2>
+<p class="mask">Paste this into the provider's user-data when you create the box.
+The login user differs by image: <code>root</code> on most, <code>ubuntu</code>
+or <code>debian</code> on the cloud images that disable it. Set the same name on
+the host below so ansible logs in as it.</p>
+<form method="get" action="/project" class="row">
+<input type="hidden" name="id" value="{{ project.id }}">
+<label>Login user <input name="cloud_user" value="{{ cloud_user }}"
+  pattern="[A-Za-z0-9._-]+" required></label>
+<button>Preview</button></form>
+<textarea rows="9" cols="76" readonly class="pick">#cloud-config
+users:
+  - name: {{ cloud_user }}
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - {{ deploy_key.public }}
+{%- if cloud_user == 'root' %}
+disable_root: false
+{%- endif %}
+</textarea>
+<p class="mask">Nothing here is secret: it is the public half only. Pin the host
+key once the box is up.</p>
+{% endif %}
+
 <h2>Hosts</h2>
 <p class="mask">Written out as the inventory at deploy time: a line per host, a
 <code>[group]</code> section per group. A pinned key goes into a known_hosts file
 for the run, so the first connection is never trust on first use and a changed
 key fails the deploy. Get it with <code>ssh-keyscan -t ed25519 host</code> and
 compare the fingerprint on the console.</p>
-<table><tr><th>Name</th><th>Address</th><th>Groups</th><th>Host key</th><th></th></tr>
+<table><tr><th>Name</th><th>Address</th><th>User</th><th>Groups</th><th>Host key</th><th></th></tr>
 {% for h in hosts %}<tr><td>{{ h.name }}</td><td>{{ h.address or '' }}</td>
-<td>{{ h.groups or '' }}</td>
+<td>{{ h.ssh_user or '' }}</td><td>{{ h.groups or '' }}</td>
 <td>{% if h.fingerprint %}<code class="pick">{{ h.fingerprint }}</code>
 {% else %}<span class="mask">not pinned</span>{% endif %}</td>
-<td>{% if is_admin %}<form method="post" action="/host" class="inline">
+<td class="row"><form method="post" action="/host_test" class="inline">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="project_id" value="{{ project.id }}">
+<input type="hidden" name="name" value="{{ h.name }}">
+<button>test login</button></form>
+{% if is_admin %}<form method="post" action="/host" class="inline">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <input type="hidden" name="project_id" value="{{ project.id }}">
 <input type="hidden" name="name" value="{{ h.name }}">
 <button name="delete" value="1" data-confirm="Remove this host?">delete</button>
 </form>{% endif %}</td></tr>
-{% else %}<tr><td colspan="5">No hosts; the environment's inventory file is used alone.</td></tr>
+{% if test and test.name == h.name %}<tr><td colspan="6">
+{% if test.ok %}Logged in to {{ h.name }} and ran <code>true</code>.
+{% else %}<span class="warn">Could not log in to {{ h.name }}.</span>{% endif %}
+<pre class="pick">{{ test.out }}</pre></td></tr>{% endif %}
+{% else %}<tr><td colspan="6">No hosts; the environment's inventory file is used alone.</td></tr>
 {% endfor %}</table>
 {% if is_admin %}<fieldset><legend>Add or update a host</legend>
 <form method="post" action="/host">
@@ -96,7 +131,9 @@ compare the fingerprint on the console.</p>
 <input type="hidden" name="project_id" value="{{ project.id }}">
 <p class="row"><label>Name <input name="name" required pattern="[A-Za-z0-9._-]+"></label>
 <label>Address <input name="address" placeholder="10.0.0.5 or host.example"></label>
-<label>Groups <input name="groups" placeholder="web,db"></label></p>
+<label>Groups <input name="groups" placeholder="web,db"></label>
+<label>Login user <input name="ssh_user" pattern="[A-Za-z0-9._-]+"
+  placeholder="root, ubuntu (optional)"></label></p>
 <p><textarea name="ssh_host_key" rows="2" cols="70"
   placeholder="ssh-ed25519 AAAA... (optional; as ssh-keyscan prints it)"></textarea></p>
 <button>Save</button></form></fieldset>{% endif %}

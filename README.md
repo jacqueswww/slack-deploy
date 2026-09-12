@@ -19,10 +19,14 @@ token held in an encrypted store that only a human-typed passphrase can open.
   `ansible-playbook`. A run can pick its own `--tags` and `--skip-tags` without
   changing what the environment stores, from the dashboard or from Slack
   (`deploy shop/prod tags=config skip=slow`).
-- **Hosts per project.** Name, address, groups and an optional pinned SSH host
-  key. Written out as the inventory for each run, alone or beside the
+- **Hosts per project.** Name, address, groups, login user and an optional pinned
+  SSH host key. Written out as the inventory for each run, alone or beside the
   environment's inventory file, and as a known_hosts file, so a changed host key
-  fails the deploy instead of being accepted.
+  fails the deploy instead of being accepted. **Test login** runs `true` over ssh
+  with that key, user and pin, so a broken host shows up before a deploy does.
+- **New servers.** The project page previews a `#cloud-config` carrying the
+  public half of the deploy key for whichever login user the image uses, to paste
+  into the provider's user-data.
 - **Git sync.** Clone or fast-forward each project's repo on demand or on a
   schedule, over HTTPS with a stored PAT or over SSH.
 - **Backups.** Daily sealed zip of the whole data directory, 90-day retention.
