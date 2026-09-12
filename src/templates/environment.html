@@ -1,0 +1,28 @@
+{% extends "layout.html" %}{% block body %}
+<h2>{{ 'Edit' if env else 'New' }} environment</h2>
+<form method="post" action="/environment"><fieldset>
+<input type="hidden" name="csrf" value="{{ csrf }}">
+{% if env %}<input type="hidden" name="id" value="{{ env.id }}">{% endif %}
+<p><label>Project <select name="project_id" required>
+{% for p in projects %}<option value="{{ p.id }}"
+  {% if env and env.project_id == p.id %}selected{% endif %}>{{ p.name }}</option>
+{% endfor %}</select></label></p>
+<p><label>Name <input name="name" value="{{ env.name if env else '' }}" required></label></p>
+<p><label>Inventory <input name="inventory" value="{{ env.inventory or '' if env else '' }}"
+   placeholder="blank: the project's hosts only"></label></p>
+<p><label>Playbook <input name="playbook" value="{{ env.playbook if env else '' }}" required></label></p>
+<p><label>Tags <input name="tags" value="{{ env.tags or '' if env else '' }}"
+   list="known-tags" placeholder="--tags, comma separated"></label></p>
+<p><label>Skip tags <input name="skip_tags" value="{{ env.skip_tags or '' if env else '' }}"
+   list="known-tags" placeholder="--skip-tags, comma separated"></label></p>
+{% if env and env.known_tags %}<datalist id="known-tags">
+{% for t in env.known_tags.split(',') %}<option value="{{ t }}">{% endfor %}</datalist>
+<p class="mask">the playbook defines: {{ env.known_tags.replace(',', ', ') }}</p>
+{% else %}<p class="mask">tags are read from the playbook on save and after a sync</p>{% endif %}
+<p><label>Limit <input name="limit_hosts" value="{{ env.limit_hosts or '' if env else '' }}"></label></p>
+<p><label><input type="checkbox" name="become" value="1"
+  {% if env and env.become %}checked{% endif %}> become (-b)</label></p>
+<button>Save</button>
+{% if env %}<button name="delete" value="1" data-confirm="Delete this environment and its secrets?">Delete</button>{% endif %}
+</fieldset></form><p><a href="/">back</a></p>
+{% endblock %}

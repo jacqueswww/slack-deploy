@@ -1,4 +1,6 @@
 config.ini
+data/
+backups/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -126,6 +128,7 @@ celerybeat.pid
 .venv
 env/
 venv/
+.lock-venv/
 ENV/
 env.bak/
 venv.bak/
@@ -155,3 +158,5 @@ dmypy.json
 cython_debug/
 
 
+AGENTS.md
+.orca/

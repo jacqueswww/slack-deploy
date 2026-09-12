@@ -1,0 +1,107 @@
+name: tests
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # sqlcipher3 ships manylinux wheels, so no system libsqlcipher is needed
+      - name: Install
+        run: make setup
+
+      - name: Test
+        run: make test
+
+      # the checks cover the library; this proves the CLI works from a checkout
+      - name: Initialise a store end to end
+        run: |
+          printf 'a shared passphrase long enough\na shared passphrase long enough\nci\nci-password-long-enough\nci-password-long-enough\n' \
+            | venv/bin/python manage.py init
+          test -f data/secrets.db
+          ! sqlite3 data/secrets.db .tables 2>/dev/null
+          ! strings data/secrets.db | grep -qiE 'xoxb|xapp'
+          venv/bin/python manage.py migrate
+          printf 'a shared passphrase long enough\n' | venv/bin/python manage.py backup
+          test -f "backups/$(date +%F).zip"
+          # deploy.db travels sealed: nothing inside the zip is readable without the password
+          ! unzip -l "backups/$(date +%F).zip" | grep -q deploy.db
+          ! strings "backups/$(date +%F).zip" | grep -q 'SQLite format'
+          printf 'a shared passphrase long enough\n' \
+            | venv/bin/python manage.py import --yes "backups/$(date +%F).zip"
+          test -f data/secrets.db
+          ls backups/*-pre-import.zip
+
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build tooling
+        run: |
+          sudo apt-get update -qq
+          # build-essential is an implicit build dependency dpkg always checks
+          # for, and it is what brings in fakeroot for Rules-Requires-Root
+          sudo apt-get install -y -qq debhelper build-essential python3-venv python3-pip
+
+      - name: Build the .deb
+        run: dpkg-buildpackage -us -uc -b
+
+      # a venv built in the build root carries that path in its scripts unless
+      # the relocation in debian/rules worked
+      - name: Nothing points back at the build root
+        run: |
+          DEB=$(ls ../hoisty_*.deb)
+          dpkg-deb -I "$DEB"
+          mkdir -p /tmp/x && dpkg-deb -x "$DEB" /tmp/x
+          ! grep -rlI -- "$GITHUB_WORKSPACE" /tmp/x/var/lib/hoisty/venv
+          head -2 /tmp/x/var/lib/hoisty/venv/bin/ansible-playbook | grep -q /var/lib/hoisty/venv
+
+      - name: Install it
+        run: sudo apt-get install -y ../hoisty_*.deb
+
+      # the invariant the whole design rests on: the service account must not be
+      # able to rewrite the program that is next handed the global password
+      - name: The service account cannot write the program
+        run: |
+          sudo -u hoisty test ! -w /var/lib/hoisty/app
+          sudo -u hoisty test ! -w /var/lib/hoisty/venv
+          sudo -u hoisty test -w /var/lib/hoisty/data
+          sudo -u hoisty test -w /var/lib/hoisty/backups
+          dpkg -V hoisty
+
+      - name: The packaged CLI runs and the daemons start locked
+        run: |
+          sudo -u hoisty hoisty --help
+          printf 'a shared passphrase long enough\na shared passphrase long enough\nci\nci-password-long-enough\nci-password-long-enough\n' \
+            | sudo -u hoisty hoisty init
+          sudo -u hoisty hoisty doctor || true
+          sudo systemctl start hoisty@bot
+          sleep 3
+          systemctl is-active hoisty@bot
+          test "$(sudo hoisty status)" = "locked"
+          # only root may drive the unlock socket
+          ! sudo -u hoisty hoisty status
+          # No Slack tokens are set here, so the daemon cannot run. It must say
+          # so at the prompt and stay locked, rather than take the password and
+          # then die where only the journal would see it.
+          printf 'a shared passphrase long enough\n' | sudo hoisty unlock \
+            | tee /tmp/unlock.out || true
+          grep -q slack_app_token /tmp/unlock.out
+          test "$(sudo hoisty status)" = "locked"
+          systemctl is-active hoisty@bot
+          # a wrong password is refused without disturbing any of that
+          printf 'not the right passphrase at all\n' | sudo hoisty unlock \
+            | grep -q 'incorrect global password' || true
+          test "$(sudo hoisty status)" = "locked"

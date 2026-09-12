@@ -1,0 +1,33 @@
+Source: hoisty
+Section: admin
+Priority: optional
+Maintainer: Jacques Wagener <jacques+noreply@dilectum.co.za>
+Build-Depends: debhelper-compat (= 13),
+               python3 (>= 3.12),
+               python3-venv,
+               python3-pip,
+               ca-certificates
+Standards-Version: 4.6.2
+Rules-Requires-Root: binary-targets
+
+Package: hoisty
+Architecture: any
+Depends: ${misc:Depends},
+         python3 (>= 3.12),
+         adduser,
+         systemd,
+         git,
+         openssh-client
+Description: Ansible deployments from Slack, with an encrypted variable store
+ hoisty runs Ansible playbooks from Slack or a web interface. Every variable,
+ SSH deploy key and API token lives in a SQLCipher database that only a
+ human-typed passphrase opens.
+ .
+ The daemons start locked and hold nothing until an administrator runs
+ "hoisty unlock" on the machine, so no passphrase is ever stored on disk and a
+ stolen disk image yields nothing. Deploy targets, their groups and their pinned
+ SSH host keys are kept per project.
+ .
+ The whole install lives under /var/lib/hoisty. The program and its vendored
+ virtualenv are root-owned and read-only to the service account, so a playbook
+ that goes bad cannot rewrite the program that is next handed the passphrase.

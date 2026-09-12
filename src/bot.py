@@ -1,213 +1,163 @@
+"""Slack socket-mode daemon. Reads everything from the encrypted store."""
 import logging
-import tempfile
-import subprocess
-import configparser
-import shutil
-
-from threading import (
-    Thread,
-    Event
-)
+import shlex
+import threading
 
 from slack_sdk import WebClient
 from slack_sdk.socket_mode import SocketModeClient
 from slack_sdk.socket_mode.response import SocketModeResponse
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger()
+import db
+import runner
+import scheduler
+import unlock
+from db import GLOBAL_SCOPE, audit, deploy_conn
 
-RUNNING_JOBS = {}
-ENVIRONMENTS = {}
-GLOBAL_SETTINGS = {}
+logger = logging.getLogger(__name__)
+
+HELP = ('Commands: `list`, `deploy <project>/<env> [tags=a,b] [skip=c]`, '
+        '`refresh-repos [project]`')
 
 
-def run_git_pull(web_client, payload, env):
-    RUNNING_JOBS[env] = True
-    envs, _ = get_config()
-    env_info = envs[env]
-
-    with tempfile.NamedTemporaryFile(suffix='.log') as logfile:
-        git_cmd = shutil.which("git")
-        completed_ps = subprocess.run(
-            [git_cmd, 'pull', 'origin', env_info.get('branch', 'master')],
-            stdout=logfile,
-            stderr=logfile,
-            cwd=env_info['working_dir']
-        )
-        logfile.seek(0)
-        output_txt = logfile.read().decode()
-        result_msg = f"[{env_info['working_dir']}] "
-        result_msg += 'git pull done' if completed_ps.returncode == 0 else 'git pull failed'
-        web_client.chat_postMessage(
-            channel=payload["event"]["channel"],
-            thread_ts=payload["event"]["ts"],
-            text=result_msg
-        )
-        if output_txt:
-            print(output_txt)
+def _notifier(web_client, payload):
+    def notify(msg, log=None):
+        web_client.chat_postMessage(channel=payload['event']['channel'],
+                                    thread_ts=payload['event']['ts'], text=msg)
+        if log:
             web_client.chat_postMessage(
-                channel=payload["event"]["channel"],
-                thread_ts=payload["event"]["ts"],
-                text='Log Output',
-                blocks=[{
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"```{output_txt[-2000:]}```"
-                    }
-                }]
-            )
-    RUNNING_JOBS[env] = False
+                channel=payload['event']['channel'], thread_ts=payload['event']['ts'],
+                text='Log output', blocks=[{'type': 'section', 'text': {
+                    'type': 'mrkdwn', 'text': f'```{log[-runner.LOG_TAIL:]}```'}}])
+    return notify
 
 
-def run_cmd(web_client, payload, env):
-    RUNNING_JOBS[env] = True
-    envs, _ = get_config()
-    env_info = envs[env]
-
-    with tempfile.NamedTemporaryFile(suffix='.log') as logfile:
-        playbook_cmd = shutil.which("ansible-playbook")
-        playbook_params = env_info['playbook_params']
-        completed_ps = subprocess.run(
-            [playbook_cmd] + playbook_params.split(' '),
-            stdout=logfile,
-            stderr=logfile,
-            cwd=env_info['working_dir']
-        )
-        logfile.seek(0)
-        output_txt = logfile.read().decode()
-        result_msg = 'Deployment done' if completed_ps.returncode == 0 else 'Deployment failed'
-        web_client.chat_postMessage(
-            channel=payload["event"]["channel"],
-            thread_ts=payload["event"]["ts"],
-            text=result_msg
-        )
-        if output_txt:
-            print(output_txt)
-            web_client.chat_postMessage(
-                channel=payload["event"]["channel"],
-                thread_ts=payload["event"]["ts"],
-                text='Log Output',
-                blocks=[{
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"```{output_txt[-2000:]}```"
-                    }
-                }]
-            )
-
-    RUNNING_JOBS[env] = False
+def _authorised(slack_user_id):
+    with deploy_conn() as conn:
+        row = conn.execute('SELECT id, username FROM user WHERE slack_user_id=? '
+                           'AND disabled=0', (slack_user_id,)).fetchone()
+    return row['username'] if row else None
 
 
-def send_response(client, req, msg):
-    response = client.web_client.chat_postMessage(
-        channel=req.payload["event"]["channel"],
-        thread_ts=req.payload["event"]["ts"],
-        text=msg
-    )
-    return response
+def _resolve(token, envs):
+    """Accept `project/env`, or a bare env name when it is unique."""
+    if '/' in token:
+        project, _, name = token.partition('/')
+        matches = [e for e in envs if e['project_name'] == project and e['name'] == name]
+    else:
+        matches = [e for e in envs if e['name'] == token]
+    return matches[0] if len(matches) == 1 else None
 
 
-def auth_blocked(client, req, global_settings):
-    return req.payload["event"]['user'] not in global_settings['user_whitelist'].split(',')
-
-
-def start_deploy(client, req):
-    envs, global_settings = get_config()
-    if auth_blocked(client, req, global_settings):
-        send_response(client, req, "You are not authorised to deploy")
+def handle(store, client, req):
+    event = req.payload.get('event', {})
+    if event.get('type') != 'app_mention' or not event.get('channel'):
         return
-    env_name = req.payload["event"]["text"].split('deploy')
-    if len(env_name) != 2:
-        send_response(client, req, "Could not parse environment name")
+    notify = _notifier(client.web_client, req.payload)
+    actor = _authorised(event.get('user'))
+    # drop the leading <@bot> mention, then dispatch on the first word
+    try:
+        words = [w for w in shlex.split(event.get('text', '')) if not w.startswith('<@')]
+    except ValueError:          # an unbalanced quote
+        notify(HELP)
         return
-    env_name = env_name[-1].strip()
-    if env_name not in envs:
-        send_response(client, req, "Environment not found")
+    command = words[0].lower() if words else ''
+    # key=value, never -flags: a leading dash is what playbook_argv refuses, and
+    # accepting one here would only produce a confusing error further in
+    options = dict(w.split('=', 1) for w in words[1:] if '=' in w)
+    plain = [w for w in words[1:] if '=' not in w]
+    arg = plain[0] if plain else None
+
+    if command not in ('list', 'deploy', 'refresh-repos', 'help'):
+        notify(HELP)
         return
-    if RUNNING_JOBS.get(env_name):
-        send_response(client, req, "Deployment already for environment")
+    if command == 'help':
+        notify(HELP)
+        return
+    if not actor:
+        notify('You are not authorised')
+        audit(event.get('user'), 'slack-denied', command)
         return
 
-    send_response(client, req, "Starting deployment for: " + env_name)
-
-    thread = Thread(
-        target=run_cmd,
-        args=(client.web_client, req.payload, env_name)
-    )
-    thread.start()
-
-
-def refresh_repos(client, req):
-    envs, global_settings = get_config()
-    if auth_blocked(client, req, global_settings):
-        send_response(client, req, "You are not authorised to refresh_repos")
-        return
-
-    working_dirs = set()
-    for env_name, env_info in envs.items():
-        working_dir = env_info['working_dir']
-        if working_dir not in working_dirs:
-            working_dirs.add(working_dir)
-            thread = Thread(
-                target=run_git_pull,
-                args=(client.web_client, req.payload, env_name)
-            )
-            thread.start()
-
-
-def process(client, req):
-    envs, global_settings = get_config()
-
-    if global_settings.get('debug', '').lower() == 'true':
-        print('------------')
-        print(client, req.payload)
-        print('------------')
-
-    if not req.payload["event"]["channel"]:
-        return
-
-    if req.payload["event"]["type"] == "app_mention" \
-            and "list" in req.payload["event"]["text"]:
-        send_response(client, req, "Configured environments: " + '\n'.join(envs))
-
-    if req.payload["event"]["type"] == "app_mention" \
-            and "deploy" in req.payload["event"]["text"]:
-
-        start_deploy(client, req)
-
-    if req.payload["event"]["type"] == "app_mention" \
-            and "refresh-repos" in req.payload["event"]["text"]:
-
-        refresh_repos(client, req)
-
-    # Acknowledge the request
-    response = SocketModeResponse(envelope_id=req.envelope_id)
-    client.send_socket_mode_response(response)
+    envs = db.environments()
+    if command == 'list':
+        if not envs:
+            notify('No environments configured')
+            return
+        notify('Configured environments:\n' + '\n'.join(
+            f"{e['project_name']}/{e['name']}" for e in envs))
+    elif command == 'deploy':
+        if not arg:
+            notify('Usage: `deploy <project>/<env>`')
+            return
+        env = _resolve(arg, envs)
+        if not env:
+            notify(f'Environment not found or ambiguous: {arg}')
+            return
+        project = db.projects(env['project_name'])[0]
+        tags, skip = options.get('tags'), options.get('skip')
+        chosen = ''.join(
+            f' {label} {value}' for label, value in
+            (('--tags', tags), ('--skip-tags', skip)) if value)
+        notify(f"Starting deployment for {env['project_name']}/{env['name']}{chosen}")
+        runner.spawn(runner.deploy, project, env, store, actor, notify,
+                     tags=tags, skip_tags=skip)
+    elif command == 'refresh-repos':
+        projects = db.projects(arg)
+        if not projects:
+            notify(f'No such project: {arg}' if arg else 'No projects configured')
+            return
+        for project in projects:
+            runner.spawn(runner.git_sync, project, store, actor, notify)
 
 
-def get_config():
-    config = configparser.ConfigParser()
-    config.read('config.ini')
-    GLOBAL_SETTINGS = dict(config['global_settings'])
-    for section in config.sections():
-        if section.startswith('env:'):
-            env_name = section.split('env:')[1]
-            ENVIRONMENTS[env_name] = dict(config[section])
-    return ENVIRONMENTS, GLOBAL_SETTINGS
+def process(store):
+    def listener(client, req):
+        try:
+            handle(store, client, req)
+        except Exception:
+            logger.exception('failed handling slack event')
+        finally:
+            client.send_socket_mode_response(
+                SocketModeResponse(envelope_id=req.envelope_id))
+    return listener
 
 
 def run():
-    envs, global_settings = get_config()
-    client = SocketModeClient(
-        app_token=global_settings.get("slack_app_token"),
-        web_client=WebClient(token=global_settings.get("slack_bot_token"))
-    )
-    client.socket_mode_request_listeners.append(process)
+    """Start locked and inert, then serve once someone unlocks.
+
+    There is nothing to do before that: the Slack tokens are themselves in the
+    encrypted store, so a locked daemon cannot even connect. That is what makes a
+    console prompt unnecessary - systemd brings the unit up at boot and it waits
+    here until an administrator runs `hoisty unlock`."""
+    runner.reap_running()
+    gate = unlock.Gate(check=startup_problem)
+    unlock.serve(gate)
+    unlock.sd_notify('READY=1\nSTATUS=locked - waiting for: hoisty unlock')
+    logger.info('locked - waiting for: hoisty unlock (%s)', unlock.SOCKET)
+    gate.ready.wait()
+    serve(gate.store)
+
+
+def startup_problem(store):
+    """Why this store cannot run the daemon, or None. Checked while the operator
+    is still on the unlock socket, so they read it at their own prompt."""
+    if db.pending(store._conn, 'secrets'):
+        return 'secrets.db has pending migrations - run: hoisty migrate --all'
+    if not (store.get(GLOBAL_SCOPE, 0, 'slack_app_token')
+            and store.get(GLOBAL_SCOPE, 0, 'slack_bot_token')):
+        return ('slack_app_token / slack_bot_token not set in the store '
+                '(hoisty secret-set slack_bot_token)')
+    return None
+
+
+def serve(store):
+    """Everything the daemon does, once it holds the key."""
+    app_token = store.get(GLOBAL_SCOPE, 0, 'slack_app_token')
+    bot_token = store.get(GLOBAL_SCOPE, 0, 'slack_bot_token')
+    scheduler.start(store)
+    client = SocketModeClient(app_token=app_token, web_client=WebClient(token=bot_token))
+    client.socket_mode_request_listeners.append(process(store))
     client.connect()
-    Event().wait()
-
-
-if __name__ == '__main__':
-    run()
+    logger.info('hoisty connected')
+    unlock.sd_notify('STATUS=connected to Slack')
+    threading.Event().wait()

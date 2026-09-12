@@ -1,0 +1,8 @@
+#!/bin/sh
+# hoisty CLI. The packaged install lives entirely under /var/lib/hoisty; these
+# defaults are what the systemd units set too, so the CLI and the daemons always
+# agree about which store they are talking about.
+set -e
+: "${HOISTY_DATA:=/var/lib/hoisty/data}"
+export HOISTY_DATA
+exec /var/lib/hoisty/venv/bin/python /var/lib/hoisty/app/manage.py "$@"

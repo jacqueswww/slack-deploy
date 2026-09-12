@@ -1,0 +1,40 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+  configure)
+    if ! getent passwd hoisty >/dev/null; then
+      adduser --system --group --home /var/lib/hoisty --no-create-home \
+              --shell /usr/sbin/nologin --quiet hoisty
+    fi
+
+    # The service account owns its data and nothing else. app/ and venv/ stay
+    # root-owned so a playbook running as hoisty cannot rewrite the program that
+    # is next handed the global password; the unit enforces the same at runtime.
+    chown root:root /var/lib/hoisty
+    chmod 0755 /var/lib/hoisty
+    chown -R root:root /var/lib/hoisty/app /var/lib/hoisty/venv
+    chmod -R go-w /var/lib/hoisty/app /var/lib/hoisty/venv
+
+    for dir in data backups projects .ssh; do
+      if [ ! -d "/var/lib/hoisty/$dir" ]; then
+        install -d -o hoisty -g hoisty -m 0700 "/var/lib/hoisty/$dir"
+      else
+        chown hoisty:hoisty "/var/lib/hoisty/$dir"
+        chmod 0700 "/var/lib/hoisty/$dir"
+      fi
+    done
+
+    sysctl --system >/dev/null 2>&1 || true
+
+    if [ ! -f /var/lib/hoisty/data/kdf.json ]; then
+      echo "hoisty: not initialised yet. Next:" >&2
+      echo "  sudo -u hoisty hoisty init" >&2
+      echo "  systemctl enable --now hoisty@bot hoisty@web" >&2
+      echo "  hoisty unlock        # as root, once per boot" >&2
+    fi
+    ;;
+esac
+
+#DEBHELPER#
+exit 0

@@ -1,0 +1,142 @@
+{% extends "layout.html" %}{% block body %}
+<h2>{{ 'Edit' if project else 'New' }} project</h2>
+<form method="post" action="/project"><fieldset>
+<input type="hidden" name="csrf" value="{{ csrf }}">
+{% if project %}<input type="hidden" name="id" value="{{ project.id }}">{% endif %}
+<p><label>Name <input name="name" value="{{ project.name if project else '' }}" required></label></p>
+<p><label>Checkout directory <input name="working_dir" size="50"
+   value="{{ project.working_dir if project else '' }}" required></label></p>
+<p><label>Branch <input name="branch" value="{{ project.branch if project else 'master' }}"></label></p>
+<p><label>Clone URL <input name="git_remote" size="50"
+   value="{{ project.git_remote or '' if project else '' }}"
+   placeholder="https://github.com/org/repo.git (optional)"></label><br>
+<span class="mask">HTTPS uses the read-only github_pat credential; SSH uses the
+daemon user's own key. Leave blank if you check the repo out by hand.</span></p>
+<button>Save</button>
+{% if project %}<button name="delete" value="1" data-confirm="Delete this project, its environments and their secrets?"
+  >Delete</button>{% endif %}
+</fieldset></form>
+
+{% if project %}
+<h2>Deploy key</h2>
+<p class="mask">The ssh key ansible uses for this project. A key set here beats
+the global one; with none set, the global one is used. The private half never
+leaves the encrypted store, and is written to a 0600 file only for the length of
+a run. Put the public half in each host's <code>authorized_keys</code>.</p>
+{% if deploy_key %}
+<table><tr><th>Name</th><th>From</th><th>Fingerprint</th><th>Updated</th></tr>
+<tr><td>{{ deploy_key.name }}</td>
+<td>{% if deploy_key.own %}this project{% else %}<span class="mask">inherited from {{ deploy_key.scope }}</span>{% endif %}</td>
+<td><code class="pick">{{ deploy_key.fingerprint or '-' }}</code></td>
+<td>{{ deploy_key.updated_at }}<br><span class="mask">{{ deploy_key.updated_by or '' }}</span></td></tr></table>
+{% if deploy_key.public %}<p><b>Public half</b><br>
+<textarea rows="2" cols="76" readonly class="pick">{{ deploy_key.public }}</textarea></p>{% endif %}
+{% else %}
+<p><span class="mask">No key set here and none global. Ansible will fall back to
+the daemon user's own ssh key.</span></p>
+{% endif %}
+
+{% if is_admin %}
+<fieldset><legend>Set this project's key</legend>
+<form method="post" action="/credentials" class="row">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="scope" value="project">
+<input type="hidden" name="scope_id" value="{{ project.id }}">
+<input type="hidden" name="back" value="{{ project.id }}">
+<label>Name <input name="name" value="{{ project.name }}-deploy" required></label>
+<button name="generate" value="1"
+  data-confirm="Generate a new key for this project? It replaces any key set here, and the old private half is gone."
+  >Generate a new key</button>
+</form>
+<form method="post" action="/credentials">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="scope" value="project">
+<input type="hidden" name="scope_id" value="{{ project.id }}">
+<input type="hidden" name="kind" value="ssh_key">
+<input type="hidden" name="back" value="{{ project.id }}">
+<p class="row"><label>Name <input name="name" value="{{ project.name }}-deploy" required></label></p>
+<p><textarea name="secret" rows="5" cols="76" required
+  placeholder="-----BEGIN OPENSSH PRIVATE KEY----- ... paste an existing private key"></textarea></p>
+<button data-confirm="Save this key? It replaces any key set on this project."
+  >Save a pasted key</button></form>
+{% if deploy_key and deploy_key.own %}
+<form method="post" action="/credentials">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="scope" value="project">
+<input type="hidden" name="scope_id" value="{{ project.id }}">
+<input type="hidden" name="kind" value="ssh_key">
+<input type="hidden" name="back" value="{{ project.id }}">
+<button name="delete" value="1"
+  data-confirm="Remove this project's key? Deploys fall back to the global one, and the private half is gone."
+  >Remove this project's key</button></form>{% endif %}
+</fieldset>{% endif %}
+
+{% if deploy_key and deploy_key.public %}
+<h2>New server</h2>
+<p class="mask">Paste this into the provider's user-data when you create the box.
+The login user differs by image: <code>root</code> on most, <code>ubuntu</code>
+or <code>debian</code> on the cloud images that disable it. Set the same name on
+the host below so ansible logs in as it.</p>
+<form method="get" action="/project" class="row">
+<input type="hidden" name="id" value="{{ project.id }}">
+<label>Login user <input name="cloud_user" value="{{ cloud_user }}"
+  pattern="[A-Za-z0-9._-]+" required></label>
+<button>Preview</button></form>
+<textarea rows="9" cols="76" readonly class="pick">#cloud-config
+users:
+  - name: {{ cloud_user }}
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - {{ deploy_key.public }}
+{%- if cloud_user == 'root' %}
+disable_root: false
+{%- endif %}
+</textarea>
+<p class="mask">Nothing here is secret: it is the public half only. Pin the host
+key once the box is up.</p>
+{% endif %}
+
+<h2>Hosts</h2>
+<p class="mask">Written out as the inventory at deploy time: a line per host, a
+<code>[group]</code> section per group. A pinned key goes into a known_hosts file
+for the run, so the first connection is never trust on first use and a changed
+key fails the deploy. Get it with <code>ssh-keyscan -t ed25519 host</code> and
+compare the fingerprint on the console.</p>
+<table><tr><th>Name</th><th>Address</th><th>User</th><th>Groups</th><th>Host key</th><th></th></tr>
+{% for h in hosts %}<tr><td>{{ h.name }}</td><td>{{ h.address or '' }}</td>
+<td>{{ h.ssh_user or '' }}</td><td>{{ h.groups or '' }}</td>
+<td>{% if h.fingerprint %}<code class="pick">{{ h.fingerprint }}</code>
+{% else %}<span class="mask">not pinned</span>{% endif %}</td>
+<td class="row"><form method="post" action="/host_test" class="inline">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="project_id" value="{{ project.id }}">
+<input type="hidden" name="name" value="{{ h.name }}">
+<button>test login</button></form>
+{% if is_admin %}<form method="post" action="/host" class="inline">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="project_id" value="{{ project.id }}">
+<input type="hidden" name="name" value="{{ h.name }}">
+<button name="delete" value="1" data-confirm="Remove this host?">delete</button>
+</form>{% endif %}</td></tr>
+{% if test and test.name == h.name %}<tr><td colspan="6">
+{% if test.ok %}Logged in to {{ h.name }} and ran <code>true</code>.
+{% else %}<span class="warn">Could not log in to {{ h.name }}.</span>{% endif %}
+<pre class="pick">{{ test.out }}</pre></td></tr>{% endif %}
+{% else %}<tr><td colspan="6">No hosts; the environment's inventory file is used alone.</td></tr>
+{% endfor %}</table>
+{% if is_admin %}<fieldset><legend>Add or update a host</legend>
+<form method="post" action="/host">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="project_id" value="{{ project.id }}">
+<p class="row"><label>Name <input name="name" required pattern="[A-Za-z0-9._-]+"></label>
+<label>Address <input name="address" placeholder="10.0.0.5 or host.example"></label>
+<label>Groups <input name="groups" placeholder="web,db"></label>
+<label>Login user <input name="ssh_user" pattern="[A-Za-z0-9._-]+"
+  placeholder="root, ubuntu (optional)"></label></p>
+<p><textarea name="ssh_host_key" rows="2" cols="70"
+  placeholder="ssh-ed25519 AAAA... (optional; as ssh-keyscan prints it)"></textarea></p>
+<button>Save</button></form></fieldset>{% endif %}
+{% endif %}
+<p><a href="/">back</a></p>
+{% endblock %}

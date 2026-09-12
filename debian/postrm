@@ -1,0 +1,18 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+  purge)
+    # Deliberately never removed: data/ is the only copy of the encrypted store
+    # and backups/ is the only way back from it. Deleting either on a purge
+    # would destroy every secret the tool holds, with no way to undo it.
+    if [ -d /var/lib/hoisty/data ] || [ -d /var/lib/hoisty/backups ]; then
+      echo "hoisty: left /var/lib/hoisty/data and /var/lib/hoisty/backups in place." >&2
+      echo "hoisty: they hold the encrypted store; remove them by hand if you mean to." >&2
+    fi
+    rm -rf /var/lib/hoisty/app /var/lib/hoisty/venv
+    ;;
+esac
+
+#DEBHELPER#
+exit 0
