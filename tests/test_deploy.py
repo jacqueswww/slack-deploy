@@ -176,6 +176,27 @@ def a_real_playbook_runs():
         'the private data dir and the key file must both be removed'
 
 
+def the_playbook_tells_us_its_own_tags():
+    """--list-tags parses the play, so the deploy form can offer what exists
+    instead of asking an operator to remember it."""
+    assert runner.list_tags(CTX['project'], CTX['env']) == ['deploy']
+    assert runner.refresh_tags(CTX['project'], CTX['env']) == ['deploy']
+    with db.deploy_conn() as conn:
+        stored = conn.execute('SELECT known_tags FROM environment WHERE id=?',
+                              (CTX['eid'],)).fetchone()['known_tags']
+    assert stored == 'deploy', stored
+
+
+def a_playbook_that_does_not_parse_keeps_the_last_tags():
+    """A refresh runs on save and after every pull; a broken play must not wipe
+    the list, and must not raise into whatever triggered it."""
+    broken = dict(CTX['env'], playbook='missing.yml')
+    assert runner.refresh_tags(CTX['project'], broken) is None
+    with db.deploy_conn() as conn:
+        assert conn.execute('SELECT known_tags FROM environment WHERE id=?',
+                            (CTX['eid'],)).fetchone()['known_tags'] == 'deploy'
+
+
 def secrets_are_redacted_from_the_log():
     assert SECRET not in CTX['log'], 'the secret leaked into the stored log'
     assert 'PRIVATE KEY' not in CTX['log'], 'the ssh key leaked into the stored log'
@@ -463,6 +484,8 @@ if __name__ == '__main__':
         argv_is_built_from_structured_fields, stored_fields_cannot_become_raw_argv,
         git_remotes_are_https_or_ssh_only, a_run_may_choose_its_own_tags,
         dates_survive_json_extravars, a_real_playbook_runs,
+        the_playbook_tells_us_its_own_tags,
+        a_playbook_that_does_not_parse_keeps_the_last_tags,
         secrets_are_redacted_from_the_log, nested_and_escaped_values_are_redacted_too,
         extravars_never_touch_argv, no_process_ever_carries_the_secret,
         no_ssh_agent_is_left_behind, a_second_deploy_is_refused_while_one_runs,

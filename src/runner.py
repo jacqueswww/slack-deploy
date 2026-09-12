@@ -33,8 +33,11 @@ GIT = '/usr/bin/git'
 SSH = '/usr/bin/ssh'
 SSH_TEST_TIMEOUT = 20
 DEPLOY_TIMEOUT = 6 * 3600
+LIST_TAGS_TIMEOUT = 120
 # fullmatch everywhere: `$` also matches before a trailing newline
 SAFE_TAGS = re.compile(r'[A-Za-z0-9_,.:-]+')
+# `--list-tags` prints `TAGS: []` per play and `TASK TAGS: [a, b]` under it
+TAGS_LISTED = re.compile(r'TAGS: \[(.*?)\]')
 # https, ssh:// or scp-style only: no file paths, no ext::/fd:: helpers, no
 # cleartext git://. GIT_ALLOW_PROTOCOL in _git_env is the second lock on that door.
 SAFE_REMOTE = re.compile(r'(https://[A-Za-z0-9._-]+(:\d+)?/|ssh://[A-Za-z0-9._@-]+(:\d+)?/'
@@ -190,6 +193,48 @@ def playbook_argv(project, env, extravars_path=None, key_path=None, inventory_pa
     if key_path:
         argv += ['--private-key', key_path]
     return argv
+
+
+def list_tags(project, env):
+    """Every tag the playbook defines, from `ansible-playbook --list-tags`.
+
+    Parses the play and nothing else: no inventory, no secrets, no host is
+    touched. The output names them per play as `TASK TAGS: [a, b]`.
+    """
+    argv = [ANSIBLE_PLAYBOOK, '--list-tags',
+            under(project['working_dir'], env['playbook'])]
+    code, out = _run(argv, project['working_dir'], env=_ansible_env(env),
+                     timeout=LIST_TAGS_TIMEOUT)
+    if code != 0:
+        raise ValueError(out.strip()[-500:] or f'ansible-playbook exited {code}')
+    found = set()
+    for group in TAGS_LISTED.findall(out):
+        found.update(tag.strip() for tag in group.split(','))
+    return sorted(t for t in found if t and t != 'always' and SAFE_TAGS.fullmatch(t))
+
+
+def refresh_tags(project, env):
+    """Cache the playbook's tags on the environment row. Best effort: a checkout
+    that is not there yet, or a playbook that no longer parses, leaves the last
+    known list alone rather than failing whatever asked for the refresh."""
+    try:
+        tags = list_tags(project, env)
+    except Exception as exc:
+        logger.info('no tag list for environment %s: %s', env['id'], exc)
+        return None
+    with deploy_conn() as conn:
+        conn.execute('UPDATE environment SET known_tags=? WHERE id=?',
+                     (','.join(tags), env['id']))
+    return tags
+
+
+def refresh_project_tags(project):
+    """After a pull: the playbook may define different tags than it did before."""
+    with deploy_conn() as conn:
+        envs = [dict(r) for r in conn.execute(
+            'SELECT * FROM environment WHERE project_id=?', (project['id'],))]
+    for env in envs:
+        refresh_tags(project, env)
 
 
 def _ansible_env(env, known_hosts=None):
@@ -458,6 +503,8 @@ def git_sync(project, store=None, actor=None, notify=None):
     if notify:
         verb = f'{kind} done' if code == 0 else f'{kind} failed'
         notify(f"[{project['name']}] {verb}", out)
+    if code == 0:
+        refresh_project_tags(project)
     return job_id
 
 

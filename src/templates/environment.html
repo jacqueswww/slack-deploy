@@ -12,9 +12,13 @@
    placeholder="blank: the project's hosts only"></label></p>
 <p><label>Playbook <input name="playbook" value="{{ env.playbook if env else '' }}" required></label></p>
 <p><label>Tags <input name="tags" value="{{ env.tags or '' if env else '' }}"
-   placeholder="--tags, comma separated"></label></p>
+   list="known-tags" placeholder="--tags, comma separated"></label></p>
 <p><label>Skip tags <input name="skip_tags" value="{{ env.skip_tags or '' if env else '' }}"
-   placeholder="--skip-tags, comma separated"></label></p>
+   list="known-tags" placeholder="--skip-tags, comma separated"></label></p>
+{% if env and env.known_tags %}<datalist id="known-tags">
+{% for t in env.known_tags.split(',') %}<option value="{{ t }}">{% endfor %}</datalist>
+<p class="mask">the playbook defines: {{ env.known_tags.replace(',', ', ') }}</p>
+{% else %}<p class="mask">tags are read from the playbook on save and after a sync</p>{% endif %}
 <p><label>Limit <input name="limit_hosts" value="{{ env.limit_hosts or '' if env else '' }}"></label></p>
 <p><label><input type="checkbox" name="become" value="1"
   {% if env and env.become %}checked{% endif %}> become (-b)</label></p>

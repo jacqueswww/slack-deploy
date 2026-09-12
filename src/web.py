@@ -508,6 +508,11 @@ class Root:
                             'playbook, tags, skip_tags, limit_hosts, become) '
                             'VALUES (?,?,?,?,?,?,?,?)', args)
             audit(actor(), 'environment-create', f'id={new_id}')
+        # the playbook may have changed: re-read its tags off-request, since
+        # parsing a big play takes longer than a form post should
+        runner.spawn(runner.refresh_tags,
+                     _row('SELECT * FROM project WHERE id=?', (project_id,)),
+                     _row('SELECT * FROM environment WHERE id=?', (id or new_id,)))
         raise cherrypy.HTTPRedirect('/')
 
     # --- deploys ----------------------------------------------------------

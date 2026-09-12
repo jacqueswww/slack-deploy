@@ -10,10 +10,12 @@
 <td><form method="post" action="/deploy" class="inline">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <input type="hidden" name="environment_id" value="{{ e.id }}">
-<input name="tags" size="7" placeholder="tags"
+<input name="tags" size="7" placeholder="tags" list="tags-{{ e.id }}"
   title="this run only; blank uses the environment's tags">
-<input name="skip_tags" size="7" placeholder="skip"
+<input name="skip_tags" size="7" placeholder="skip" list="tags-{{ e.id }}"
   title="this run only; blank uses the environment's skip tags">
+{% if e.known_tags %}<datalist id="tags-{{ e.id }}">
+{% for t in e.known_tags.split(',') %}<option value="{{ t }}">{% endfor %}</datalist>{% endif %}
 <button>Deploy</button></form>
 <a href="/environment?id={{ e.id }}">edit</a></td>
 </tr>{% else %}<tr><td colspan="6">No environments yet.</td></tr>{% endfor %}
